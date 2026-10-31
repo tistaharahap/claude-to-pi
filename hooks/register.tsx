@@ -10,11 +10,15 @@ import {
   agentRecord,
   applyEvent,
   buildArgv,
+  classifyEnd,
+  decideBackground,
+  failureMessage,
   filterModels,
   formatCost,
   formatDuration,
   formatModel,
   formatTokens,
+  hostExposesBackground,
   isValidProfileName,
   newTally,
   parseLine,
@@ -22,22 +26,34 @@ import {
   parseModelRef,
   planRun,
   profileDescription,
+  readOptions,
+  resolveHostExposes,
+  shouldDrawLiveRow,
+  type FailureCause,
+  type RunLimits,
   type RunPlan,
   type RunTally,
   takeLines,
   viewOf,
+  watchdogCheck,
+  type WatchdogKind,
 } from './pi'
 
 const STORE_KEY = 'settings'
 const PANE = 'pi-models'
-const REDRAW_MS = 200
+// The live row redraws at least this often, pi output or not, so its elapsed
+// time keeps ticking through a long silent model turn; the watchdogs are
+// checked on the same beat.
+const REDRAW_MS = 1000
 
 // Bump a shape tag whenever that value's fields change: it declines what an
 // earlier version stored, which outlives a hot reload.
 const settingsAtom = atom({ plugin: 'pi', key: 'settings' } as const, EMPTY_SETTINGS, {
   shape: 'settings-1',
 })
-const runsAtom = atom({ plugin: 'pi', key: 'runs' } as const, {}, { shape: 'runs-1' })
+const runsAtom = atom({ plugin: 'pi', key: 'runs' } as const, {}, { shape: 'runs-2' })
+// What the host's Agent tool offers, read off its full description.
+const hostAtom = atom({ plugin: 'pi', key: 'host' } as const, {}, { shape: 'host-1' })
 const pickerAtom = atom(
   { plugin: 'pi', key: 'picker' } as const,
   { filter: '', thinking: 'inherit', target: 'default', models: [], isLoading: false },
@@ -154,6 +170,7 @@ function currentFor(s: PiSettings, target: string): PiModel | undefined {
 type PiJob = {
   piPath: string
   isolate: boolean
+  limits: RunLimits
   plan: RunPlan
   prompt: string
   description: string
@@ -163,16 +180,22 @@ type PiJob = {
 
 type PiOutcome = {
   tally: RunTally
+  /** Why the run ended without an answer; undefined when it answered. */
+  cause?: FailureCause
+  /** What the model or the notification reads when `cause` is set. */
   error?: string
-  interrupted: boolean
   durationMs: number
 }
 
-const STDERR_NOISE = /^Warning: Extension package/
+type Pull = IteratorResult<{ stream: 'stdout' | 'stderr'; text: string }, { code: number | null; signal: string | null }>
 
 /**
  * Runs `pi --print --mode json` for a job, folding its event stream into a
  * tally and the live row's state; `onProgress` sees the tally as it grows.
+ *
+ * Every REDRAW_MS the row is redrawn (so elapsed time ticks while pi is
+ * silent) and the watchdogs are checked: no pi JSON event for `idleMs`, or
+ * `wallMs` in all, kills pi and ends the run with a named error.
  */
 async function runPi(
   $: $,
@@ -198,62 +221,116 @@ async function runPi(
   const tally = newTally()
   let stderr = ''
   let exit: { code: number | null; signal: string | null } | undefined
-  let lastDraw = 0
+  let spawnError: string | undefined
+  let watchdog: WatchdogKind | undefined
+  let lastDraw = Number.NEGATIVE_INFINITY
+  let lastEventAt = startedAt
+  let hasOutput = false
   const argv = buildArgv({ piPath: job.piPath, plan: job.plan, prompt: job.prompt, isolate: job.isolate })
 
+  const draw = async (now: number): Promise<void> => {
+    lastDraw = now
+    await update($, runsAtom, runs => ({
+      ...runs,
+      [job.runKey]: { ...viewOf(base, tally), status: hasOutput ? ('running' as const) : ('starting' as const), updatedAt: now },
+    }))
+    if (onProgress !== undefined) await onProgress(tally)
+  }
+
+  const child = $.process.spawn({ argv, env: { PI_SUBAGENT: '1' } })
+  const iter = child[Symbol.asyncIterator]()
+  let tick: Promise<'tick'> | undefined
   try {
-    const child = $.process.spawn({ argv, env: { PI_SUBAGENT: '1' } })
     let buffer = ''
-    const iter = child[Symbol.asyncIterator]()
+    let pull: Promise<Pull> = iter.next() as Promise<Pull>
     for (;;) {
-      const step = await iter.next()
-      if (step.done === true) {
-        exit = step.value
-        break
-      }
-      const chunk = step.value
-      if (chunk.stream === 'stderr') {
-        stderr = (stderr + chunk.text).slice(-4000)
+      tick ??= $.clock.sleep(REDRAW_MS, signal !== undefined ? { signal } : undefined).then(() => 'tick' as const)
+      const got = await Promise.race([pull, tick])
+      if (got === 'tick') {
+        tick = undefined
+        const now = await $.clock.now()
+        watchdog = watchdogCheck({ now, startedAt, lastEventAt, limits: job.limits })
+        if (watchdog !== undefined) {
+          // Ending the stream kills pi. Don't wait on it: a hung child may
+          // never answer the pull still pending.
+          pull.catch(() => {})
+          void Promise.resolve(iter.return?.({ code: null, signal: 'SIGTERM' })).catch(() => {})
+          break
+        }
+        await draw(now)
         continue
       }
+      if (got.done === true) {
+        exit = got.value
+        break
+      }
+      const chunk = got.value
+      if (chunk.stream === 'stderr') {
+        stderr = (stderr + chunk.text).slice(-4000)
+        pull = iter.next() as Promise<Pull>
+        continue
+      }
+      hasOutput = true
       const { lines, rest } = takeLines(buffer + chunk.text)
       buffer = rest
+      let sawEvent = false
       for (const line of lines) {
         const ev = parseLine(line)
-        if (ev !== undefined) applyEvent(tally, ev)
+        if (ev !== undefined) {
+          applyEvent(tally, ev)
+          sawEvent = true
+        }
       }
-      const now = Date.now()
-      if (now - lastDraw >= REDRAW_MS) {
-        lastDraw = now
-        await update($, runsAtom, runs => ({
-          ...runs,
-          [job.runKey]: { ...viewOf(base, tally), status: 'running' as const },
-        }))
-        if (onProgress !== undefined) await onProgress(tally)
-      }
+      const now = await $.clock.now()
+      if (sawEvent) lastEventAt = now
+      if (now - lastDraw >= REDRAW_MS) await draw(now)
+      // Ask for more only once this piece is drawn.
+      pull = iter.next() as Promise<Pull>
     }
     const ev = parseLine(buffer)
     if (ev !== undefined) applyEvent(tally, ev)
   } catch (err) {
-    tally.error = signal?.aborted === true ? 'interrupted' : `Could not run ${job.piPath}: ${String(err)}`
+    if (signal?.aborted !== true) spawnError = String(err)
+  } finally {
+    // The beat still pending rejects if the signal aborts later: nobody waits on it.
+    tick?.catch(() => {})
   }
 
   const endedAt = await $.clock.now()
-  const interrupted = signal?.aborted === true
-  const failedExit = exit !== undefined && exit.code !== 0 && tally.finalText.trim() === ''
-  const stderrTail = stderr
-    .split('\n')
-    .filter(l => l.trim() !== '' && !STDERR_NOISE.test(l))
-    .slice(-5)
-    .join('\n')
-  const error =
-    tally.error ?? (failedExit ? stderrTail || `pi exited with code ${String(exit?.code)}` : undefined)
-  const status: PiRun['status'] = interrupted ? 'interrupted' : error !== undefined ? 'failed' : 'completed'
+  const durationMs = endedAt - startedAt
+  const cause = classifyEnd({ watchdog, aborted: signal?.aborted === true, spawnError, tally, exit })
+  // A provider hiccup pi recovered from still leaves an answer worth keeping.
+  const failed = cause !== undefined && !(cause.kind === 'provider' && tally.finalText.trim() !== '')
+  const error = failed
+    ? failureMessage({
+        cause,
+        agentType: job.plan.agentType,
+        model: tally.models[tally.models.length - 1] ?? formatModel(job.plan.model),
+        elapsedMs: durationMs,
+        limits: job.limits,
+        tally,
+        stderr,
+        piPath: job.piPath,
+      })
+    : undefined
+  const status: PiRun['status'] = cause?.kind === 'user' ? 'interrupted' : failed ? 'failed' : 'completed'
   await update($, runsAtom, runs => ({
     ...runs,
     [job.runKey]: { ...viewOf(base, tally), status, endedAt, ...(error !== undefined ? { error } : {}) },
   }))
-  return { tally, interrupted, durationMs: endedAt - startedAt, ...(error !== undefined ? { error } : {}) }
+  return { tally, durationMs, ...(failed ? { cause, error } : {}) }
+}
+
+/** Whether this session's Agent tool can ask for run_in_background at all. */
+async function agentExposesBackground($: $): Promise<boolean | undefined> {
+  const described = (await read($, hostAtom)).agentExposesBackground
+  if (described !== undefined) return described
+  try {
+    const agent = (await $.tool.list()).find(t => t.name === 'Agent')
+    return resolveHostExposes(undefined, agent?.description)
+  } catch {
+    return undefined
+  }
 }
 
 /** Keeps the live-row map small: finished runs past the newest 20 go. */
@@ -287,7 +364,7 @@ async function runInBackground($: $, job: PiJob, outputFile: string): Promise<vo
     lastWrite = now
     await $.fs.write(outputFile, progressReport(job, tally, '## Status\nRunning…'))
   })
-  const ok = out.error === undefined || out.tally.finalText.trim() !== ''
+  const ok = out.error === undefined
   const final = ok
     ? `## Final report\n\n${out.tally.finalText}`
     : `## Failed\n\n${out.error ?? 'unknown error'}`
@@ -297,13 +374,12 @@ async function runInBackground($: $, job: PiJob, outputFile: string): Promise<vo
   await $.prompt.submit({
     text: ok
       ? `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") completed on ${out.tally.models[out.tally.models.length - 1] ?? formatModel(job.plan.model)} (${meta}). Output file: ${outputFile}\n\nFinal report:\n${out.tally.finalText}\n</task-notification>`
-      : `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") failed: ${out.error ?? 'unknown error'}. Output file: ${outputFile}\n</task-notification>`,
+      : `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") failed. Output file: ${outputFile}\n\n${out.error ?? 'unknown error'}\n</task-notification>`,
   })
 }
 
 export const register: Register = (on, options) => {
-  const piPath = typeof options.piPath === 'string' && options.piPath !== '' ? options.piPath : 'pi'
-  const isolate = options.isolate !== false
+  const { piPath, isolate, background, limits } = readOptions(options)
 
   // ------------------------------------------------------------- lifecycle
 
@@ -341,6 +417,7 @@ export const register: Register = (on, options) => {
     const job: PiJob = {
       piPath,
       isolate,
+      limits,
       plan,
       prompt: e.prompt,
       description: e.description,
@@ -348,10 +425,16 @@ export const register: Register = (on, options) => {
       agentId: `pi-${crypto.randomUUID().slice(0, 12)}`,
     }
 
-    if ((e as { run_in_background?: unknown }).run_in_background === true) {
+    const flag = (e as { run_in_background?: unknown }).run_in_background
+    const mode = decideBackground(
+      background,
+      flag,
+      background === 'auto' && flag === undefined ? await agentExposesBackground($) : undefined,
+    )
+    if (mode.background) {
       const dir = `${((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')}/claude-pi`
       const outputFile = `${dir}/${job.agentId}.md`
-      await $.fs.write(outputFile, `# ${plan.agentType}: ${e.description}\n\nStarting pi (${formatModel(plan.model)})…\n`)
+      await $.fs.write(outputFile, `# ${plan.agentType}: ${e.description}\n\nStarting pi (${formatModel(plan.model)}) in the background: ${mode.reason}.\n`)
       void runInBackground($, job, outputFile).catch(err => {
         $.ui.toast(`${plan.agentType} failed to report back: ${String(err)}`)
       })
@@ -371,10 +454,7 @@ export const register: Register = (on, options) => {
     }
 
     const out = await runPi($, job, next.signal)
-    if (out.interrupted) return { deny: 'The pi subagent was interrupted.' }
-    if (out.error !== undefined && out.tally.finalText.trim() === '') {
-      return { deny: `pi subagent failed (${formatModel(plan.model)}): ${out.error}` }
-    }
+    if (out.error !== undefined) return { deny: out.error }
     return {
       result: agentRecord({
         agentId: job.agentId,
@@ -392,14 +472,23 @@ export const register: Register = (on, options) => {
         : next(e),
   )
 
+  // The engine computes the Agent tool's description (with or without the
+  // run_in_background paragraph) before the model sees it: note which.
+  on('tool.describe', { tool: 'Agent' }, async ($, e, next) => {
+    const described = await next(e)
+    const exposes = hostExposesBackground(described.description)
+    const host = await read($, hostAtom)
+    if (host.agentExposesBackground !== exposes) await update($, hostAtom, () => ({ agentExposesBackground: exposes }))
+    return described
+  })
+
   // ---------------------------------------------------- the live Agent row
 
   on('ui.render', { component: 'ToolUse', props: { tool: 'Agent' } }, async ($, e, next) => {
     const input = (e.props.input ?? {}) as { subagent_type?: unknown; description?: string }
-    if (piTypeOf(input.subagent_type) === undefined || e.props.isExpanded === true) return next(e)
-    const runs = await read($, runsAtom)
-    const run = runs[e.requestId]
-    if (run === undefined || !e.props.isRunning) return next(e)
+    if (piTypeOf(input.subagent_type) === undefined) return next(e)
+    const run = (await read($, runsAtom))[e.requestId]
+    if (run === undefined || !shouldDrawLiveRow(run, e.props)) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
     const elapsed = formatDuration((await $.clock.now()) - run.startedAt)

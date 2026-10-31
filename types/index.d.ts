@@ -37,6 +37,8 @@ export type PiRun = {
   model: string
   startedAt: number
   endedAt?: number
+  /** When the bridge last redrew the row (at least every second while running). */
+  updatedAt?: number
   status: 'starting' | 'running' | 'completed' | 'failed' | 'interrupted'
   steps: PiStep[]
   toolCount: number
@@ -70,6 +72,7 @@ declare module 'claude-code' {
       settings: Shaped<PiSettings>
       runs: Shaped<Record<string, PiRun>>
       picker: Shaped<PiPicker>
+      host: Shaped<{ agentExposesBackground?: boolean }>
     }
   }
 }

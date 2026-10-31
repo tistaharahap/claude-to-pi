@@ -24,6 +24,24 @@
       "title": "Isolate pi subagents",
       "description": "Run pi with --no-extensions, --no-prompt-templates and --no-themes so your interactive pi packages don't change subagent behaviour.",
       "default": true
+    },
+    "background": {
+      "type": "string",
+      "title": "Background pi runs",
+      "description": "auto: run in the background when the Agent call sets run_in_background, or when this session's Agent tool has no run_in_background parameter (so a long run can't block the turn). always: every pi run is a background task. never: every pi run is in the foreground with a live row.",
+      "default": "auto"
+    },
+    "idleTimeoutSec": {
+      "type": "number",
+      "title": "Idle timeout (seconds)",
+      "description": "Kill a pi run that sends no JSON event for this long, and report it as stalled.",
+      "default": 180
+    },
+    "maxRunMinutes": {
+      "type": "number",
+      "title": "Wall-clock cap (minutes)",
+      "description": "Kill any pi run that is still going after this long.",
+      "default": 30
     }
   }
 }

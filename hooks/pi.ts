@@ -359,3 +359,224 @@ export function profileDescription(p: PiProfile): string {
       : 'pi subagent that can read, run commands and edit files.')
   return `${base} Runs on the pi coding agent with ${formatModel(p.model)}.`
 }
+
+// ---------------------------------------------------------------------------
+// Plugin options, background choice, watchdogs and failure messages
+
+export const BACKGROUND_MODES = ['auto', 'always', 'never'] as const
+export type BackgroundMode = (typeof BACKGROUND_MODES)[number]
+
+export const DEFAULT_IDLE_TIMEOUT_SEC = 180
+export const DEFAULT_MAX_RUN_MINUTES = 30
+
+/** How long a run may go without a pi JSON event, and how long it may run at all. */
+export type RunLimits = { idleMs: number; wallMs: number }
+
+export type PluginSettings = {
+  piPath: string
+  isolate: boolean
+  background: BackgroundMode
+  limits: RunLimits
+}
+
+function positive(v: unknown, fallback: number): number {
+  const n = typeof v === 'string' ? Number(v) : v
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+/** Reads the plugin's `userConfig` values, falling back to defaults on anything odd. */
+export function readOptions(options: Readonly<Record<string, unknown>>): PluginSettings {
+  const piPath = typeof options.piPath === 'string' && options.piPath.trim() !== '' ? options.piPath : 'pi'
+  const mode = typeof options.background === 'string' ? options.background.trim().toLowerCase() : ''
+  return {
+    piPath,
+    isolate: options.isolate !== false,
+    background: (BACKGROUND_MODES as readonly string[]).includes(mode) ? (mode as BackgroundMode) : 'auto',
+    limits: {
+      idleMs: positive(options.idleTimeoutSec, DEFAULT_IDLE_TIMEOUT_SEC) * 1000,
+      wallMs: positive(options.maxRunMinutes, DEFAULT_MAX_RUN_MINUTES) * 60_000,
+    },
+  }
+}
+
+/**
+ * Whether the host's Agent tool lets the model ask for a background run, read
+ * off the tool's description (the only part of its schema a plugin can see).
+ * Undefined when the description is unknown.
+ */
+export function hostExposesBackground(agentDescription: string | undefined): boolean | undefined {
+  if (agentDescription === undefined) return undefined
+  return /run_in_background/.test(agentDescription)
+}
+
+/**
+ * Combines what the host told us about its Agent tool. `described` comes from
+ * the full description (`tool.describe`); `summary` is `$.tool.list()`'s,
+ * which the engine cuts to its first 300 characters, so a summary can prove
+ * the parameter is there but never that it is missing.
+ */
+export function resolveHostExposes(described: boolean | undefined, summary: string | undefined): boolean | undefined {
+  if (described !== undefined) return described
+  return hostExposesBackground(summary) === true ? true : undefined
+}
+
+/**
+ * Decides whether one Agent call runs in the background.
+ *
+ * - `always` / `never` force it.
+ * - `auto` honours an explicit `run_in_background` on the call. When the call
+ *   carries none and the host's Agent tool has no such parameter (so the model
+ *   could not have asked), the run goes to the background: a long pi run in
+ *   the foreground blocks the whole turn. When the host does offer the
+ *   parameter, or we can't tell, its absence means foreground.
+ */
+export function decideBackground(
+  mode: BackgroundMode,
+  flag: unknown,
+  hostExposes: boolean | undefined,
+): { background: boolean; reason: string } {
+  if (mode === 'always') return { background: true, reason: 'background: "always"' }
+  if (mode === 'never') return { background: false, reason: 'background: "never"' }
+  if (flag === true) return { background: true, reason: 'run_in_background: true' }
+  if (flag === false) return { background: false, reason: 'run_in_background: false' }
+  if (hostExposes === false) {
+    return { background: true, reason: 'the Agent tool here has no run_in_background parameter' }
+  }
+  return { background: false, reason: 'run_in_background not set' }
+}
+
+export type WatchdogKind = 'idle' | 'wall'
+
+/** Which watchdog, if any, has expired for a run. */
+export function watchdogCheck(opts: {
+  now: number
+  startedAt: number
+  lastEventAt: number
+  limits: RunLimits
+}): WatchdogKind | undefined {
+  const { now, startedAt, lastEventAt, limits } = opts
+  if (now - startedAt >= limits.wallMs) return 'wall'
+  if (now - lastEventAt >= limits.idleMs) return 'idle'
+  return undefined
+}
+
+const STDERR_NOISE = /^Warning: Extension package/
+
+/** The last `n` meaningful lines pi wrote to stderr. */
+export function stderrTail(stderr: string, n = 5): string[] {
+  return stderr
+    .split('\n')
+    .map(l => l.trimEnd())
+    .filter(l => l.trim() !== '' && !STDERR_NOISE.test(l))
+    .slice(-n)
+}
+
+/** The run's last tool step, as one line. */
+export function lastStep(tally: RunTally): string | undefined {
+  const s = tally.steps[tally.steps.length - 1]
+  if (s === undefined) return undefined
+  const state = s.isError ? 'failed' : s.isDone ? 'done' : 'still running'
+  return `${s.tool} ${s.summary} (${state})`
+}
+
+/** Why a run ended without an answer. */
+export type FailureCause =
+  | { kind: 'user' }
+  | { kind: 'watchdog'; watchdog: WatchdogKind }
+  | { kind: 'provider'; message: string }
+  | { kind: 'exit'; code: number | null; signal: string | null }
+  | { kind: 'spawn'; message: string }
+
+/**
+ * Classifies how a run ended: a watchdog kill and the person's Esc come
+ * first (both abort pi), then pi's own error, then a bad exit.
+ */
+export function classifyEnd(opts: {
+  watchdog?: WatchdogKind
+  aborted: boolean
+  spawnError?: string
+  tally: RunTally
+  exit?: { code: number | null; signal: string | null }
+}): FailureCause | undefined {
+  const { watchdog, aborted, spawnError, tally, exit } = opts
+  if (watchdog !== undefined) return { kind: 'watchdog', watchdog }
+  if (aborted) return { kind: 'user' }
+  if (spawnError !== undefined) return { kind: 'spawn', message: spawnError }
+  if (tally.error !== undefined) return { kind: 'provider', message: tally.error }
+  if (exit !== undefined && exit.code !== 0 && tally.finalText.trim() === '') {
+    return { kind: 'exit', code: exit.code, signal: exit.signal }
+  }
+  return undefined
+}
+
+/** The message the model (or a task notification) reads for a failed run. */
+export function failureMessage(opts: {
+  cause: FailureCause
+  agentType: string
+  model: string
+  elapsedMs: number
+  limits: RunLimits
+  tally: RunTally
+  stderr: string
+  piPath?: string
+}): string {
+  const { cause, agentType, model, elapsedMs, limits, tally } = opts
+  const ran = formatDuration(elapsedMs)
+  const who = `${agentType} on ${model}`
+  let head: string
+  let hint: string
+  switch (cause.kind) {
+    case 'user':
+      head = `The pi subagent ${who} was interrupted by the user (Esc) after ${ran}.`
+      hint = 'Ask the user before retrying; for long work use run_in_background, or pi through Bash in the background.'
+      break
+    case 'watchdog':
+      if (cause.watchdog === 'idle') {
+        head = `The pi watchdog stopped ${who}: pi sent no events for ${formatDuration(limits.idleMs)} (idle limit), after ${ran} in total.`
+        hint = 'The model or provider looks stalled. Retry, pick another model with /pi, or raise the plugin option idleTimeoutSec.'
+      } else {
+        head = `The pi watchdog stopped ${who}: it hit the ${formatDuration(limits.wallMs)} wall-clock cap (ran ${ran}).`
+        hint = 'Split the task into smaller runs, or raise the plugin option maxRunMinutes.'
+      }
+      break
+    case 'provider':
+      head = `pi subagent ${who} failed with a provider/model error after ${ran}: ${cause.message}`
+      hint = 'Check the model id and provider sign-in (pi auth check), or pick another model with /pi.'
+      break
+    case 'exit':
+      head = `pi subagent ${who} exited ${cause.signal !== null ? `on ${cause.signal}` : `with code ${String(cause.code)}`} after ${ran} without a final answer.`
+      hint = 'See pi’s stderr below.'
+      break
+    case 'spawn':
+      head = `Could not run ${opts.piPath ?? 'pi'} for ${who}: ${cause.message}`
+      hint = 'Check that pi is installed and on PATH, or set the plugin option piPath.'
+      break
+  }
+  const tokens = tally.input + tally.output + tally.cacheRead + tally.cacheWrite
+  const lines = [
+    head,
+    `Partial progress: ${tally.toolCount} tool use${tally.toolCount === 1 ? '' : 's'}, ${formatTokens(tokens)} tokens${tally.cost > 0 ? `, ${formatCost(tally.cost)}` : ''}.`,
+  ]
+  const step = lastStep(tally)
+  lines.push(`Last tool step: ${step ?? '(none)'}`)
+  const partial = tally.finalText.trim() !== '' ? tally.finalText : tally.tail
+  if (partial.trim() !== '') lines.push(`Partial answer so far: ${oneLine(partial, 600)}`)
+  const err = stderrTail(opts.stderr)
+  if (err.length > 0) lines.push('pi stderr (last 5 lines):', ...err.map(l => `  ${l}`))
+  lines.push(hint)
+  return lines.join('\n')
+}
+
+/**
+ * Whether the bridge draws an Agent row itself: while its pi run is going.
+ * Decided from the run, not the row's `isRunning`, which the terminal reports
+ * false for an Agent call a plugin answers (seen in a real session), and with
+ * the call's stored result as the end.
+ */
+export function shouldDrawLiveRow(
+  run: Pick<PiRun, 'endedAt'> | undefined,
+  props: { output?: unknown; isExpanded?: boolean },
+): boolean {
+  if (run === undefined || props.isExpanded === true) return false
+  return run.endedAt === undefined && props.output === undefined
+}

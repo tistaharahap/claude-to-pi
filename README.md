@@ -34,6 +34,8 @@ The `Agent` tool's own parameters still apply:
 - `effort: "low" … "max"` sets pi's `--thinking` level.
 - `run_in_background: true` returns right away. Progress streams to an output file Claude can read, and the final report comes back as a task notification when pi finishes.
 
+The plugin also ships a skill, `using-pi-subagents`, that teaches Claude when to send work to pi and how to do it. It covers choosing a model with `/pi` (Claude can't pick a pi model through the Agent call), confirming the model that actually ran via `resolvedModel`, comparing several models side by side, and what pi agents don't support.
+
 ## Choosing providers and models
 
 | Command | Effect |

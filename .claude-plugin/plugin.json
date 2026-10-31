@@ -1,0 +1,29 @@
+{
+  "name": "pi",
+  "version": "0.1.0",
+  "description": "Run Claude Code subagents on the pi coding agent, with any pi provider and model.",
+  "author": {
+    "name": "Batista Harahap"
+  },
+  "keywords": [
+    "pi",
+    "subagents",
+    "agents",
+    "multi-provider"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "piPath": {
+      "type": "string",
+      "title": "pi executable",
+      "description": "Path or name of the pi binary (resolved on PATH).",
+      "default": "pi"
+    },
+    "isolate": {
+      "type": "boolean",
+      "title": "Isolate pi subagents",
+      "description": "Run pi with --no-extensions, --no-prompt-templates and --no-themes so your interactive pi packages don't change subagent behaviour.",
+      "default": true
+    }
+  }
+}

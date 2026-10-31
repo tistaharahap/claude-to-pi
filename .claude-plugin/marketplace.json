@@ -1,0 +1,6 @@
+{
+  "name": "claude-to-pi",
+  "description": "Run Claude Code subagents on the pi coding agent with any provider and model.",
+  "owner": { "name": "Batista Harahap" },
+  "plugins": [{ "name": "pi", "source": "./" }]
+}

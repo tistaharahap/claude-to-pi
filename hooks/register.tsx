@@ -1,7 +1,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { PiModel, PiPicker, PiProfile, PiRun, PiSettings } from '../types'
+import type { PiAgentSummary, PiModel, PiPicker, PiRun, PiSettings } from '../types'
+import {
+  type AgentFile,
+  type AgentScope,
+  type PiAgentDef,
+  agentFileOf,
+  agentNotes,
+  bridgeNote,
+  chooseAgentFile,
+  isPiModelRef,
+  mapTools,
+  parsePiAgent,
+  projectAgentDirs,
+  projectDirs,
+  renderAgentFile,
+  setAgentModel,
+  skillBody,
+  thinkingOf,
+} from './agents'
 import {
   BUILTIN_AGENTS,
   EMPTY_SETTINGS,
@@ -44,6 +62,7 @@ import {
   takeLines,
   viewOf,
   watchdogCheck,
+  withEffort,
   type WatchdogKind,
 } from './pi'
 
@@ -68,12 +87,225 @@ const pickerAtom = atom(
   { shape: 'picker-1' },
 )
 
+// The pi agents found in agent files, for /pi status, profile list and the picker.
+const agentsAtom = atom({ plugin: 'pi', key: 'agents' } as const, { list: [] }, { shape: 'agents-1' })
+// Where the engine says each agent type it lists comes from (agent.offer's
+// `source`), so a name defined in several places resolves the way Claude Code does.
+const offersAtom = atom({ plugin: 'pi', key: 'offers' } as const, {}, { shape: 'offers-1' })
+
 type $ = EngineInterface
 
 function piTypeOf(subagentType: unknown): string | undefined {
   return typeof subagentType === 'string' && subagentType.startsWith('pi:')
     ? subagentType.slice(3)
     : undefined
+}
+
+// ------------------------------------------------------------- agent files
+
+async function homeDir($: $): Promise<string | undefined> {
+  try {
+    const home = (await $.env.get('HOME'))?.replace(/\/+$/, '')
+    return home === undefined || home === '' ? undefined : home
+  } catch {
+    return undefined
+  }
+}
+
+async function readText($: $, path: string): Promise<string | undefined> {
+  try {
+    return await $.fs.read(path)
+  } catch {
+    return undefined
+  }
+}
+
+/** The agent files in one folder and its subfolders, as Claude Code loads them. */
+async function listAgentFiles($: $, dir: string, scope: AgentScope, depth = 0): Promise<AgentFile[]> {
+  let entries: Awaited<ReturnType<$['fs']['list']>>
+  try {
+    entries = await $.fs.list(dir)
+  } catch {
+    return []
+  }
+  const files: AgentFile[] = []
+  for (const entry of [...entries].sort((a, b) => a.name.localeCompare(b.name))) {
+    const path = `${dir}/${entry.name}`
+    if (entry.kind === 'dir' && depth < 3) files.push(...(await listAgentFiles($, path, scope, depth + 1)))
+    else if (entry.kind === 'file' && entry.name.endsWith('.md')) {
+      const text = await readText($, path)
+      const file = text === undefined ? undefined : agentFileOf(text, path, scope)
+      if (file !== undefined) files.push(file)
+    }
+  }
+  return files
+}
+
+/** Every agent file Claude Code reads: the project's folders closest first, then the user's. */
+async function scanAgentFiles($: $): Promise<AgentFile[]> {
+  const cwd = await $.session.cwd()
+  const home = await homeDir($)
+  const files: AgentFile[] = []
+  for (const dir of projectAgentDirs(cwd, home)) files.push(...(await listAgentFiles($, dir, 'project')))
+  if (home !== undefined) files.push(...(await listAgentFiles($, `${home}/.claude/agents`, 'user')))
+  return files
+}
+
+/**
+ * The pi agent Claude Code would run for `name`: the agent file that wins for
+ * that name, when its model is a pi model. `anySource` skips the engine's word
+ * on where the name comes from (for `pi:<name>`, which the engine never lists).
+ */
+async function findPiAgent($: $, name: string, anySource = false): Promise<PiAgentDef | undefined> {
+  const files = await scanAgentFiles($)
+  const source = anySource ? undefined : (await read($, offersAtom))[name]
+  const file = chooseAgentFile(files, name, source)
+  if (file === undefined || !isPiModelRef(file.model)) return undefined
+  return parsePiAgent(file.text, file.path, file.scope)
+}
+
+/** The pi agents among the agent files, the winning file per name, for listings. */
+async function refreshAgents($: $): Promise<PiAgentSummary[]> {
+  const files = await scanAgentFiles($)
+  const list: PiAgentSummary[] = []
+  const seen = new Set<string>()
+  for (const file of files) {
+    if (seen.has(file.name)) continue
+    seen.add(file.name)
+    if (!isPiModelRef(file.model)) continue
+    const def = parsePiAgent(file.text, file.path, file.scope)
+    if (def === undefined) continue
+    const tools = mapTools(def.tools, def.disallowedTools)
+    list.push({
+      name: def.name,
+      model: def.model,
+      scope: def.scope,
+      path: def.path,
+      readOnly: tools.readOnly,
+      warnings: agentNotes({ def, unmapped: tools.unmapped, missingSkills: [] }),
+    })
+  }
+  await update($, agentsAtom, () => ({ list }))
+  return list
+}
+
+/**
+ * The skills an agent file preloads, read from the project's and the user's
+ * `.claude/skills/<name>/SKILL.md`, as text for pi's system prompt.
+ */
+async function loadSkills($: $, names: readonly string[]): Promise<{ blocks: string[]; missing: string[] }> {
+  const blocks: string[] = []
+  const missing: string[] = []
+  if (names.length === 0) return { blocks, missing }
+  const cwd = await $.session.cwd()
+  const home = await homeDir($)
+  const roots = [...projectDirs(cwd, home), ...(home !== undefined ? [home] : [])]
+  for (const name of names) {
+    let found = false
+    if (/^[\w.-]+$/.test(name)) {
+      for (const root of roots) {
+        const dir = `${root}/.claude/skills/${name}`
+        const text = await readText($, `${dir}/SKILL.md`)
+        if (text === undefined) continue
+        blocks.push(`# Skill: ${name}\n\n(The skill's files are in ${dir}.)\n\n${skillBody(text)}`)
+        found = true
+        break
+      }
+    }
+    if (!found) missing.push(name)
+  }
+  return { blocks, missing }
+}
+
+/** Plans a run of a pi agent file: its model, tools, prompt, skills and limits. */
+async function planAgentFile($: $, def: PiAgentDef, effort?: string): Promise<RunPlan> {
+  const tools = mapTools(def.tools, def.disallowedTools)
+  const skills = await loadSkills($, def.skills)
+  const own = thinkingOf(def.effort)
+  const base = def.model.thinking === undefined && own !== undefined ? { ...def.model, thinking: own } : def.model
+  const model = withEffort(base, effort) ?? base
+  const prompt = [def.prompt, ...skills.blocks].filter(p => p.trim() !== '').join('\n\n')
+  const notes = agentNotes({ def, unmapped: tools.unmapped, missingSkills: skills.missing })
+  return {
+    agentType: def.name,
+    model,
+    readOnly: tools.readOnly,
+    ...(tools.tools !== undefined ? { tools: tools.tools } : {}),
+    ...(tools.exclude !== undefined ? { excludeTools: tools.exclude } : {}),
+    mcp: tools.mcp,
+    ...(prompt !== '' ? { prompt } : {}),
+    ...(def.omitClaudeMd ? { noContextFiles: true } : {}),
+    ...(def.maxTurns !== undefined ? { maxTurns: def.maxTurns } : {}),
+    ...(notes.length > 0 ? { notes } : {}),
+  }
+}
+
+/** What an Agent call resolves to: a pi run, a refusal, or (undefined) not pi's. */
+type Target = { plan: RunPlan; background: boolean } | { deny: string }
+
+async function targetOfDef($: $, def: PiAgentDef, effort?: string): Promise<Target> {
+  if (def.isolation !== undefined) {
+    return { deny: `${def.name} runs on pi, which does not support isolation "${def.isolation}" (set in ${def.path}).` }
+  }
+  return { plan: await planAgentFile($, def, effort), background: def.background }
+}
+
+async function resolveTarget($: $, subagentType: unknown, alias?: string, effort?: string): Promise<Target | undefined> {
+  if (typeof subagentType !== 'string' || subagentType === '') return undefined
+  const name = piTypeOf(subagentType)
+  if (name !== undefined) {
+    const settings = await read($, settingsAtom)
+    const builtin = planRun(settings, name, alias, effort)
+    if (builtin !== undefined) return { plan: builtin, background: false }
+    // `pi:<name>` from before agent files: the profile now lives in `<name>.md`.
+    const def = await findPiAgent($, name, true)
+    if (def !== undefined) return targetOfDef($, def, effort)
+    const known = [...BUILTIN_AGENTS.map(n => `pi:${n}`), ...(await refreshAgents($)).map(a => a.name)]
+    return { deny: `Unknown pi agent type "${subagentType}". Available: ${known.join(', ')}.` }
+  }
+  const def = await findPiAgent($, subagentType)
+  return def === undefined ? undefined : targetOfDef($, def, effort)
+}
+
+/** Writes an agent file and refreshes the listing of pi agent files. */
+async function writeAgentFile($: $, path: string, text: string): Promise<void> {
+  await $.fs.write(path, text)
+  await refreshAgents($)
+}
+
+/**
+ * Profiles an earlier version kept in the plugin's store become agent files in
+ * `~/.claude/agents/`, so they stay available in every project. A name that
+ * already has a file there is left alone.
+ */
+async function migrateProfiles($: $, s: PiSettings): Promise<PiSettings> {
+  if (s.profiles.length === 0) return s
+  const home = await homeDir($)
+  if (home === undefined) return s
+  const moved: string[] = []
+  const kept: string[] = []
+  for (const p of s.profiles) {
+    const path = `${home}/.claude/agents/${p.name}.md`
+    if (await $.fs.exists(path).catch(() => true)) {
+      kept.push(p.name)
+      continue
+    }
+    await $.fs.write(
+      path,
+      renderAgentFile({ name: p.name, model: p.model, readOnly: p.readOnly, description: profileDescription(p) }),
+    )
+    moved.push(p.name)
+  }
+  const next = { ...s, profiles: [] }
+  await saveSettings($, next)
+  if (moved.length > 0 || kept.length > 0) {
+    $.ui.toast(
+      `pi profiles are agent files now: ${moved.length > 0 ? `moved ${moved.join(', ')} to ~/.claude/agents/` : ''}${
+        kept.length > 0 ? `${moved.length > 0 ? '; ' : ''}${kept.join(', ')} already had a file there, left as is` : ''
+      }. Restart Claude Code to list them under their own names.`,
+    )
+  }
+  return next
 }
 
 function normalizeSettings(raw: unknown): PiSettings {
@@ -120,9 +352,6 @@ async function registerAgents($: $, s: PiSettings): Promise<void> {
     description: `Read-only pi subagent for searching and understanding a codebase (read, grep, find, ls).${routing}`,
     ...placeholder('explore'),
   })
-  for (const p of s.profiles) {
-    await $.agent.register({ name: p.name, description: profileDescription(p), ...placeholder(p.name) })
-  }
 }
 
 async function saveSettings($: $, s: PiSettings, agentsChanged = true): Promise<void> {
@@ -161,18 +390,19 @@ async function applyPick($: $, picked: PiModel): Promise<string> {
     await saveSettings($, { ...s, tiers: { ...s.tiers, [alias]: model } })
     return `Agent model "${alias}" now runs ${formatModel(model)} on pi`
   }
-  const name = p.target.slice(8)
-  await saveSettings($, {
-    ...s,
-    profiles: s.profiles.map(pr => (pr.name === name ? { ...pr, model } : pr)),
-  })
-  return `pi:${name} now runs ${formatModel(model)}`
+  const agent = (await read($, agentsAtom)).list.find(a => `agent:${a.path}` === p.target)
+  if (agent === undefined) return 'That pi agent is gone; reopen /pi to refresh the list.'
+  const text = await readText($, agent.path)
+  const updated = text === undefined ? undefined : setAgentModel(text, model)
+  if (updated === undefined) return `Could not update ${agent.path}.`
+  await writeAgentFile($, agent.path, updated)
+  return `${agent.name} now runs ${formatModel(model)} (${agent.path})`
 }
 
-function currentFor(s: PiSettings, target: string): PiModel | undefined {
+function currentFor(s: PiSettings, agents: readonly PiAgentSummary[], target: string): PiModel | undefined {
   if (target === 'default') return s.defaultModel
   if (target.startsWith('tier:')) return s.tiers[target.slice(5) as keyof PiSettings['tiers']]
-  return s.profiles.find(p => p.name === target.slice(8))?.model
+  return agents.find(a => `agent:${a.path}` === target)?.model
 }
 
 /** One pi subagent run: what to run and where its live row is kept. */
@@ -202,6 +432,21 @@ type PiOutcome = {
   /** Attempts that failed and were retried, one line each. */
   history: string[]
   durationMs: number
+  /** Set when the run was stopped at its agent file's maxTurns. */
+  turnCapped?: number
+}
+
+/** The lines a finished run's report ends with: recovery, a turn cap, fields pi did not apply. */
+function reportNote(job: PiJob, out: PiOutcome): string | undefined {
+  const ranOn = out.tally.models[out.tally.models.length - 1] ?? formatModel(job.plan.model)
+  const lines = [
+    recoveryNote(out.history, ranOn),
+    out.turnCapped !== undefined
+      ? `[pi bridge: stopped at the agent's maxTurns (${out.turnCapped}); the answer may be partial.]`
+      : undefined,
+    bridgeNote(job.plan.notes ?? []),
+  ].filter((l): l is string => l !== undefined)
+  return lines.length === 0 ? undefined : lines.join('\n')
 }
 
 type Pull = IteratorResult<{ stream: 'stdout' | 'stderr'; text: string }, { code: number | null; signal: string | null }>
@@ -210,6 +455,8 @@ type AttemptEnd = {
   exit?: { code: number | null; signal: string | null }
   spawnError?: string
   watchdog?: WatchdogKind
+  /** The run reached its maxTurns and was stopped there. */
+  turnCapped?: boolean
 }
 
 /**
@@ -317,13 +564,22 @@ async function runPi(
         let sawEvent = false
         for (const line of lines) {
           const ev = parseLine(line)
-          if (ev !== undefined) {
-            applyEvent(tally, ev)
-            sawEvent = true
+          if (ev === undefined) continue
+          // A turn past the agent's maxTurns doesn't start: keep what the earlier turns found.
+          if (ev.type === 'turn_start' && job.plan.maxTurns !== undefined && tally.turns >= job.plan.maxTurns) {
+            end.turnCapped = true
+            break
           }
+          applyEvent(tally, ev)
+          sawEvent = true
         }
         const now = await $.clock.now()
         if (sawEvent) lastEventAt = now
+        if (end.turnCapped === true) {
+          pull.catch(() => {})
+          void Promise.resolve(iter.return?.({ code: null, signal: 'SIGTERM' })).catch(() => {})
+          break
+        }
         if (now - lastDraw >= REDRAW_MS) await draw(now)
         // Ask for more only once this piece is drawn.
         pull = iter.next() as Promise<Pull>
@@ -344,6 +600,7 @@ async function runPi(
   // The session the next attempt forks: the last one that holds messages.
   let resumeFrom: string | undefined
   let cause: FailureCause | undefined
+  let turnCapped: number | undefined
   let stallMs = stallLimitFor(job.limits, 0)
   for (let n = 0; ; n++) {
     stallMs = stallLimitFor(job.limits, n)
@@ -358,6 +615,11 @@ async function runPi(
     })
     beginAttempt(tally)
     const end = await attempt(argv, stallMs)
+    if (end.turnCapped === true) {
+      cause = undefined
+      turnCapped = job.plan.maxTurns
+      break
+    }
     const attemptCause = classifyEnd({ ...end, aborted: signal?.aborted === true, tally })
     // A provider hiccup pi recovered from still leaves an answer worth keeping.
     const failed = attemptCause !== undefined && !(attemptCause.kind === 'provider' && tally.finalText.trim() !== '')
@@ -410,7 +672,13 @@ async function runPi(
   // A finished run's sessions are of no further use; a failed run's are kept
   // so the person can pick the work up (the error says how).
   if (cause === undefined || cause.kind === 'user') await removeDir($, job.sessionDir)
-  return { tally, durationMs, history, ...(cause !== undefined ? { cause, error } : {}) }
+  return {
+    tally,
+    durationMs,
+    history,
+    ...(cause !== undefined ? { cause, error } : {}),
+    ...(turnCapped !== undefined ? { turnCapped } : {}),
+  }
 }
 
 /** Removes a run's own session folder; best effort (the OS cleans temp anyway). */
@@ -479,7 +747,7 @@ async function runInBackground($: $, job: PiJob, outputFile: string): Promise<vo
   })
   const ok = out.error === undefined
   const ranOn = out.tally.models[out.tally.models.length - 1] ?? formatModel(job.plan.model)
-  const note = recoveryNote(out.history, ranOn)
+  const note = reportNote(job, out)
   const final = ok
     ? `## Final report\n\n${out.tally.finalText}${note !== undefined ? `\n\n${note}` : ''}`
     : `## Failed\n\n${out.error ?? 'unknown error'}`
@@ -498,36 +766,69 @@ export const register: Register = (on, options) => {
 
   // ------------------------------------------------------------- lifecycle
 
+  // Agent calls this bridge answers, so its error handler knows them.
+  const claimed = new Set<string>()
+
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    const s = normalizeSettings(await $.store.get(STORE_KEY))
+    let s = normalizeSettings(await $.store.get(STORE_KEY))
     await update($, settingsAtom, () => s)
     showStatus($, s)
     await $.command.register({
       name: 'pi',
-      description: 'Choose the pi provider/model for pi subagents, map tiers, manage pi agent profiles',
+      description: 'Choose the pi provider/model for pi subagents, map tiers, write pi agent files',
       argumentHint: '[status | model <provider/model[:thinking]> | tier <haiku|sonnet|opus|fable> <ref> | profile add|rm|list | fallback add|rm|clear|list | models [search]]',
       immediate: true,
     })
     await registerAgents($, s)
+    try {
+      s = await migrateProfiles($, s)
+      await refreshAgents($)
+    } catch (err) {
+      $.ui.log(`pi: could not read agent files: ${String(err)}`, { to: 'debug' })
+    }
     return started
   })
 
   // ------------------------------------------------- the Agent tool, on pi
 
-  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    const name = piTypeOf(e.subagent_type)
-    if (name === undefined) return next(e)
+  // Where each agent type the model is offered comes from: an agent file in
+  // the project or the user's folder, or somewhere the bridge can't read.
+  on('agent.offer', async ($, e, next) => {
+    const offered = await next(e)
+    try {
+      const offers = await read($, offersAtom)
+      if (offers[e.agent] !== e.source) await update($, offersAtom, o => ({ ...o, [e.agent]: e.source }))
+    } catch {
+      // Only a hint for resolving names; never worth failing the listing over.
+    }
+    return offered
+  })
 
-    const settings = await read($, settingsAtom)
-    const plan = planRun(settings, name, e.model, e.effort)
-    if (plan === undefined) {
-      const known = [...BUILTIN_AGENTS, ...settings.profiles.map(p => p.name)].map(n => `pi:${n}`)
-      return { deny: `Unknown pi agent type "pi:${name}". Available: ${known.join(', ')}.` }
+  // Only the Agent tool reaches the bridge. A pi agent started any other way
+  // (a workflow's agent(), a teammate, another plugin's spawn) would run on
+  // Claude with a model the API refuses, so it is refused here with the reason.
+  on('agent.spawn', async ($, e, next) => {
+    if (e.fork) return next(e)
+    const type = e.subagentType
+    // Every subagent passes through here: a failed lookup must not block them.
+    const isPi = piTypeOf(type) !== undefined || (await findPiAgent($, type).catch(() => undefined)) !== undefined
+    if (!isPi) return next(e)
+    return {
+      deny: `${type} runs on pi, and only the Agent tool can start a pi agent. Call the Agent tool with subagent_type "${type}" instead (not a workflow agent or a teammate).`,
     }
+  })
+
+  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const target = await resolveTarget($, e.subagent_type, e.model, e.effort)
+    if (target === undefined) return next(e)
+    if ('deny' in target) return { deny: target.deny }
+    claimed.add(e.tool_use_id)
+    const { plan } = target
     if (e.isolation !== undefined) {
-      return { deny: `pi subagents do not support isolation "${e.isolation}"; call again without it.` }
+      return { deny: `${plan.agentType} runs on pi, which does not support isolation "${e.isolation}"; call again without it.` }
     }
+    const settings = await read($, settingsAtom)
 
     const agentId = `pi-${crypto.randomUUID().slice(0, 12)}`
     const tmp = await tempDir($)
@@ -545,7 +846,8 @@ export const register: Register = (on, options) => {
       sessionDir: `${tmp}/claude-pi/sessions/${agentId}`,
     }
 
-    const flag = (e as { run_in_background?: unknown }).run_in_background
+    // An agent file with `background: true` always runs in the background, as in Claude Code.
+    const flag = target.background ? true : (e as { run_in_background?: unknown }).run_in_background
     const mode = decideBackground(
       background,
       flag,
@@ -575,7 +877,7 @@ export const register: Register = (on, options) => {
 
     const out = await runPi($, job, next.signal)
     if (out.error !== undefined) return { deny: out.error }
-    const note = recoveryNote(out.history, out.tally.models[out.tally.models.length - 1] ?? formatModel(plan.model))
+    const note = reportNote(job, out)
     return {
       result: agentRecord({
         agentId: job.agentId,
@@ -589,7 +891,7 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) =>
     next.called
       ? next(e)
-      : piTypeOf((e as { subagent_type?: unknown }).subagent_type) !== undefined
+      : piTypeOf((e as { subagent_type?: unknown }).subagent_type) !== undefined || claimed.has(e.tool_use_id)
         ? { deny: `The pi bridge failed: ${next.error?.message ?? 'unknown error'}` }
         : next(e),
   )
@@ -607,8 +909,7 @@ export const register: Register = (on, options) => {
   // ---------------------------------------------------- the live Agent row
 
   on('ui.render', { component: 'ToolUse', props: { tool: 'Agent' } }, async ($, e, next) => {
-    const input = (e.props.input ?? {}) as { subagent_type?: unknown; description?: string }
-    if (piTypeOf(input.subagent_type) === undefined) return next(e)
+    // Rows of pi runs only: the bridge keeps a run for each Agent call it answers.
     const run = (await read($, runsAtom))[e.requestId]
     if (run === undefined || !shouldDrawLiveRow(run, e.props)) return next(e)
 
@@ -649,12 +950,16 @@ export const register: Register = (on, options) => {
 
     if (sub === undefined || sub === 'models' || sub === 'pick') {
       await update($, pickerAtom, p => ({ ...p, filter: rest.join(' ') }))
+      await refreshAgents($)
       await $.ui.open({ id: PANE, title: 'pi models', focus: true, closeOnEscape: true })
       await loadModels($, piPath)
       return { text: 'Opened the pi model picker.' }
     }
 
-    if (sub === 'status') return { text: describe(s) }
+    if (sub === 'status') {
+      const agents = await refreshAgents($)
+      return { text: describe(s, agents, await $.session.cwd(), await homeDir($)) }
+    }
     if (sub === 'help') return { text: HELP }
 
     if (sub === 'model') {
@@ -693,40 +998,61 @@ export const register: Register = (on, options) => {
       }
     }
 
-    if (sub === 'profile') {
-      const [action, name, ref, ...more] = rest
+    if (sub === 'profile' || sub === 'profiles') {
+      const flags = rest.filter(w => w.startsWith('--'))
+      const [action, name, ref, ...more] = rest.filter(w => !w.startsWith('--'))
+      const isUser = flags.includes('--user')
+      const readOnly = flags.includes('--read-only')
+      const cwd = await $.session.cwd()
+      const home = await homeDir($)
       if (action === 'list' || action === undefined) {
+        const agents = await refreshAgents($)
         return {
           text:
-            s.profiles.length === 0
-              ? 'No pi profiles. Add one: /pi profile add <name> <provider/model[:thinking]> [--read-only] [description]'
-              : s.profiles
-                  .map(p => `pi:${p.name} → ${formatModel(p.model)}${p.readOnly ? ' (read-only)' : ''}`)
-                  .join('\n'),
+            agents.length === 0
+              ? `No pi agents yet. Add one: ${PROFILE_USAGE}`
+              : agents.map(a => agentLine(a, cwd, home)).join('\n'),
         }
       }
       if (action === 'rm' || action === 'remove') {
-        if (name === undefined) return { text: 'Usage: /pi profile rm <name>' }
-        if (!s.profiles.some(p => p.name === name)) return { text: `No pi profile named ${name}.` }
-        await saveSettings($, { ...s, profiles: s.profiles.filter(p => p.name !== name) })
-        return { text: `Removed pi:${name}. It leaves the agent list once this session restarts.` }
+        if (name === undefined) return { text: 'Usage: /pi profile rm <name> [--user]' }
+        const files = await scanAgentFiles($)
+        const file = files.find(f => f.name === name && (isUser ? f.scope === 'user' : true))
+        if (file === undefined) return { text: `No agent file named ${name}${isUser ? ' in ~/.claude/agents' : ''}.` }
+        if (!isPiModelRef(file.model)) {
+          return { text: `${shortPath(file.path, cwd, home)} is not a pi agent (its model is not pi:…); edit or delete it yourself.` }
+        }
+        await $.process.run(['rm', '-f', '--', file.path], { timeoutMs: 10_000 })
+        await refreshAgents($)
+        return { text: `Removed ${shortPath(file.path, cwd, home)}. ${name} leaves the agent list once Claude Code reloads its agents (restart the session if it is still listed).` }
       }
       if (action === 'add') {
-        if (name === undefined || ref === undefined) {
-          return { text: 'Usage: /pi profile add <name> <provider/model[:thinking]> [--read-only] [description]' }
-        }
+        if (name === undefined || ref === undefined) return { text: `Usage: ${PROFILE_USAGE}` }
         if (!isValidProfileName(name)) {
-          return { text: `Profile names use letters, digits, _ and - and cannot be ${BUILTIN_AGENTS.join(' or ')}.` }
+          return { text: `Agent names here use letters, digits, _ and - and cannot be ${BUILTIN_AGENTS.join(' or ')}.` }
         }
-        const model = parseModelRef(ref)
+        const model = parseModelRef(ref.replace(/^pi:/, ''))
         if (model === undefined) return { text: `Not a model reference: ${ref}` }
-        const readOnly = more.includes('--read-only')
-        const words = more.filter(w => w !== '--read-only').join(' ')
-        const profile: PiProfile = { name, model, readOnly, ...(words !== '' ? { description: words } : {}) }
-        await saveSettings($, { ...s, profiles: [...s.profiles.filter(p => p.name !== name), profile] })
-        return { text: `Added subagent type pi:${name} → ${formatModel(model)}${readOnly ? ' (read-only)' : ''}.` }
+        if (isUser && home === undefined) return { text: 'Could not find your home folder for --user.' }
+        const dir = isUser ? `${home}/.claude/agents` : `${cwd}/.claude/agents`
+        const path = `${dir}/${name}.md`
+        if (await $.fs.exists(path).catch(() => false)) {
+          return { text: `${shortPath(path, cwd, home)} already exists. Edit it, or remove it first with /pi profile rm ${name}${isUser ? ' --user' : ''}.` }
+        }
+        const words = more.join(' ').trim()
+        const description =
+          words !== ''
+            ? `${words}${/[.!?]$/.test(words) ? '' : '.'} Runs on pi (${formatModel(model)}).`
+            : profileDescription({ name, model, readOnly })
+        await writeAgentFile($, path, renderAgentFile({ name, model, readOnly, description }))
+        const others = (await scanAgentFiles($)).filter(f => f.name === name && f.path !== path)
+        const shadow =
+          others.length > 0 ? ` Another agent file also defines ${name} (${others.map(f => shortPath(f.path, cwd, home)).join(', ')}); Claude Code uses the project's over the user's.` : ''
+        return {
+          text: `Wrote ${shortPath(path, cwd, home)}: the subagent type ${name} runs on pi (${formatModel(model)})${readOnly ? ', read-only' : ''}. Claude Code lists it once it reloads its agents (restart the session if it doesn't show yet).${shadow}`,
+        }
       }
-      return { text: 'Usage: /pi profile <add|rm|list> …' }
+      return { text: `Usage: ${PROFILE_USAGE} | /pi profile rm <name> [--user] | /pi profile list` }
     }
 
     if (sub === 'fallback' || sub === 'fallbacks') {
@@ -786,11 +1112,12 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const p: PiPicker = await read($, pickerAtom)
     const s = await read($, settingsAtom)
+    const agents = (await read($, agentsAtom)).list
     if (e.surface === 'mobile') {
       const { Box, Text } = $.ui.resolve(e)
       return (
         <Box flexDirection="column">
-          <Text>{describe(s)}</Text>
+          <Text>{describe(s, agents, await $.session.cwd(), await homeDir($))}</Text>
           <Text dimColor>Set models with /pi model provider/model[:thinking].</Text>
         </Box>
       )
@@ -799,12 +1126,12 @@ export const register: Register = (on, options) => {
     const targets = [
       { value: 'default', label: `Default (pi:agent, pi:explore) — ${formatModel(s.defaultModel)}` },
       ...TIER_ALIASES.map(a => ({ value: `tier:${a}`, label: `Agent model "${a}" — ${formatModel(s.tiers[a])}` })),
-      ...s.profiles.map(pr => ({ value: `profile:${pr.name}`, label: `pi:${pr.name} — ${formatModel(pr.model)}` })),
+      ...agents.map(a => ({ value: `agent:${a.path}`, label: `${a.name} (${a.scope} agent file) — ${formatModel(a.model)}` })),
     ]
     const matches = filterModels(p.models, p.filter)
     const room = Math.max(5, Math.min(60, e.props.scroll.bodyRows - 8))
     const shown = matches.slice(0, room)
-    const current = currentFor(s, p.target)
+    const current = currentFor(s, agents, p.target)
     const currentValue = current === undefined ? undefined : `${current.provider}/${current.model}`
     return (
       <Box flexDirection="column">
@@ -872,11 +1199,23 @@ export const register: Register = (on, options) => {
   })
 }
 
-function describe(s: PiSettings): string {
+/** A path as the person reads it: relative to the project, or under `~`. */
+function shortPath(path: string, cwd: string, home?: string): string {
+  if (path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1)
+  if (home !== undefined && path.startsWith(`${home}/`)) return `~/${path.slice(home.length + 1)}`
+  return path
+}
+
+function agentLine(a: PiAgentSummary, cwd: string, home?: string): string {
+  const head = `${a.name} → ${formatModel(a.model)}${a.readOnly ? ' (read-only)' : ''} · ${shortPath(a.path, cwd, home)}`
+  return [head, ...a.warnings.map(w => `    ⚠ ${w}`)].join('\n')
+}
+
+function describe(s: PiSettings, agents: readonly PiAgentSummary[], cwd: string, home?: string): string {
   const lines = [
     `pi:agent, pi:explore → ${formatModel(s.defaultModel)}`,
     ...TIER_ALIASES.filter(a => s.tiers[a] !== undefined).map(a => `Agent model "${a}" → ${formatModel(s.tiers[a])}`),
-    ...s.profiles.map(p => `pi:${p.name} → ${formatModel(p.model)}${p.readOnly ? ' (read-only)' : ''}`),
+    ...(agents.length > 0 ? ['Agent files on pi:', ...agents.map(a => `  ${agentLine(a, cwd, home)}`)] : []),
     ...(s.fallbacks !== undefined && s.fallbacks.length > 0
       ? [`Fallbacks when a run stalls: ${s.fallbacks.map(m => formatModel(m)).join(' → ')}`]
       : []),
@@ -884,14 +1223,18 @@ function describe(s: PiSettings): string {
   return lines.join('\n')
 }
 
+const PROFILE_USAGE = '/pi profile add <name> <provider/model[:thinking]> [--read-only] [--user] [description]'
+
 const HELP = [
   '/pi                         open the model picker',
-  '/pi status                  show which pi models the pi subagents use',
+  '/pi status                  show which pi models the pi subagents and pi agent files use',
   '/pi model <ref>|reset       set the default model (ref: provider/model[:thinking])',
   '/pi <provider/model>        shorthand for /pi model',
   '/pi tier <alias> <ref>|reset  map the Agent tool’s model alias (haiku, sonnet, opus, fable) to a pi model',
-  '/pi profile add <name> <ref> [--read-only] [description]   add a subagent type pi:<name>',
-  '/pi profile rm <name> | list',
+  `${PROFILE_USAGE}`,
+  '                            write .claude/agents/<name>.md (--user: ~/.claude/agents/) with model: pi:<ref>',
+  '/pi profile rm <name> [--user] | list   remove or list pi agent files',
   '/pi fallback add <ref> …    models a stalled run moves to from its 2nd retry (rm <ref>, clear, list)',
   '/pi models [search]         open the picker filtered',
+  'Any agent file in .claude/agents/ or ~/.claude/agents/ with model: pi:<provider>/<model> runs on pi.',
 ].join('\n')

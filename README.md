@@ -2,6 +2,20 @@
 
 A Claude Code plugin that runs subagents on [pi](https://github.com/badlogic/pi-mono), the multi-provider coding agent, so Claude can hand work to OpenAI, OpenRouter, or any other provider/model pi supports. It works through the normal `Agent` tool: pi subagents show up in Claude's agent list, run with a live progress row in the transcript, and return through the standard subagent hand-back.
 
+Any Claude Code agent file can run on pi: give it a pi model.
+
+```markdown
+# .claude/agents/reviewer.md
+---
+name: reviewer
+description: Reviews diffs for correctness bugs. Use after any non-trivial change.
+model: pi:openai/gpt-5.5
+effort: high
+tools: Read, Grep, Glob
+---
+You are a strict code reviewer…
+```
+
 ## Install
 
 ```
@@ -12,7 +26,7 @@ or from a shell: `claude plugin install pi --marketplace tistaharahap/claude-to-
 
 For development, load it from a checkout: `claude --plugin-dir /path/to/claude-to-pi`.
 
-Requirements: `pi` on your `PATH` (or set the plugin's `piPath` option), with at least one provider signed in (`pi auth check --provider <name>`).
+Requirements: `pi` on your `PATH` (or set the plugin's `piPath` option), with at least one provider signed in (`pi auth check --provider <name>`). Tested with pi 1.5.
 
 ## Using it
 
@@ -24,15 +38,44 @@ Claude picks one of these agent types:
 
 | Agent type | What it does |
 | --- | --- |
-| `pi:agent` | General-purpose: reads, runs commands, edits files (pi's full tool set). |
+| `pi:agent` | General-purpose: reads, runs commands, edits files (pi's full tool set, and pi's MCP servers). |
 | `pi:explore` | Read-only: `read`, `grep`, `find`, `ls`. |
-| `pi:<profile>` | Your own types, each bound to a model (see `/pi profile`). |
+| `<name>` | Any agent file whose `model` is `pi:<provider>/<model>[:thinking]` (see below). |
 
 The `Agent` tool's own parameters still apply:
 
 - `model: "haiku" | "sonnet" | "opus" | "fable"` picks the pi model you mapped to that tier with `/pi tier`. Unmapped tiers use the default.
 - `effort: "low" … "max"` sets pi's `--thinking` level.
 - `run_in_background: true` returns right away. Progress streams to an output file Claude can read, and the final report comes back as a task notification when pi finishes. Some sessions' Agent tool has no `run_in_background`; see the `background` option below.
+
+## Agent files on pi
+
+Claude Code reads agent files from `.claude/agents/` in the project (and its parent folders) and from `~/.claude/agents/`. Set an agent's `model` to `pi:` followed by a pi model reference and it runs on pi. Claude Code lists it under its own name with its own description, and Claude calls it like any other agent: `Agent({ subagent_type: "reviewer", … })`. Everything else about the file works the way Claude Code reads it, as far as pi can do it:
+
+| Field | On pi |
+| --- | --- |
+| body | Appended to pi's own system prompt, after a short subagent brief. |
+| `model: pi:<provider>/<model>[:thinking]` | `--model` (and `--thinking`). The Agent call's `model` alias doesn't change it. |
+| `effort` | pi's thinking level, unless the model reference sets one. The Agent call's `effort` wins over both. |
+| `tools` | pi's allowlist: `Read`→`read`, `Grep`→`grep`, `Glob`→`find`+`ls`, `LS`→`ls`, `Bash`→`bash`, `Edit`/`MultiEdit`→`edit`, `Write`→`write`, `mcp__server__tool` (or `mcp__server` for all of a server's tools) → pi's MCP tool of that name. Tools with no pi equivalent (`WebFetch`, `WebSearch`, …) are left out, and the report says which. Without `tools`, the agent gets all of pi's tools. |
+| `disallowedTools` | pi's denylist, mapped the same way. |
+| `skills` | Each skill's `SKILL.md` (from `.claude/skills/<name>/` in the project or in `~/.claude`) is preloaded into the agent's prompt. |
+| `omitClaudeMd: true` | `--no-context-files`: pi skips `AGENTS.md`/`CLAUDE.md`. |
+| `background: true` | The run goes to the background, as if the call set `run_in_background: true` (the plugin's `background: "never"` still keeps it in the foreground). |
+| `maxTurns` | The run stops before turn `maxTurns + 1` and returns what it has, marked as possibly partial. |
+| `isolation: worktree` | Refused, as for the Agent call. |
+| `mcpServers`, `hooks`, `permissionMode`, `memory` | Not applied. The report ends with a note that says so. |
+| `color`, `initialPrompt`, `autoCompactWindow` | Ignored. |
+
+**MCP servers.** A pi agent uses the MCP servers configured in pi itself, not Claude Code's. Add the servers your agents need to pi with `pi mcp add <name> …` (`pi mcp list` shows them). Which of them an agent can call follows Claude Code's rule for `tools`: without a `tools` list the agent gets all of them; with one, only the MCP tools it names (and none, with pi's MCP turned off, when it names none). `pi:agent` gets them all; `pi:explore` none.
+
+**Trust.** Claude Code only runs in a folder you trusted (under `claude -p`, trust is implied), so pi runs with `--approve` and trusts the project's own `.pi/` files too.
+
+**Without the plugin.** An agent file with a `pi:` model still loads, but when the plugin isn't there to catch the call, Claude Code sends the model name to the Claude API and the run fails with `model_not_found`. It never quietly runs on Claude.
+
+**Only through the Agent tool.** A pi agent started any other way (a workflow script's `agent()`, a teammate, another plugin's spawn) is refused with a message that says to use the Agent tool. `claude --agent <name>` (a pi agent as the main session) is not supported and fails as above.
+
+`/pi profile add` writes these files for you (next section). `/pi status` and `/pi profile list` list the pi agent files and warn about fields pi won't apply. Profiles from earlier versions of the plugin are moved to `~/.claude/agents/<name>.md` the first time a session starts, and calls to `pi:<name>` still reach them.
 
 ## Options
 
@@ -56,13 +99,13 @@ The plugin also ships a skill, `using-pi-subagents`, that teaches Claude when to
 
 | Command | Effect |
 | --- | --- |
-| `/pi` | Opens the model picker: filter pi's model list, choose a thinking level, and set the default, a tier, or a profile. |
-| `/pi status` | Shows which models the pi agent types use. |
+| `/pi` | Opens the model picker: filter pi's model list, choose a thinking level, and set the default, a tier, or an agent file's model. |
+| `/pi status` | Shows which models the pi agent types and pi agent files use. |
 | `/pi model openai/gpt-5.5:high` | Sets the default for `pi:agent` and `pi:explore` (`/pi model reset` goes back to pi's own default). |
 | `/pi openrouter/qwen/qwen3-coder` | Shorthand for `/pi model …`. |
-| `/pi tier haiku openai/gpt-5.4-mini` | Calls with `model: "haiku"` on pi types run that model. |
-| `/pi profile add fast openai/gpt-5.4-mini:low --read-only Quick lookups` | Adds the agent type `pi:fast`. |
-| `/pi profile rm fast` / `/pi profile list` | Removes or lists profiles. |
+| `/pi tier haiku openai/gpt-5.4-mini` | Calls with `model: "haiku"` on `pi:agent`/`pi:explore` run that model. |
+| `/pi profile add fast openai/gpt-5.4-mini:low --read-only Quick lookups` | Writes `.claude/agents/fast.md` with `model: pi:openai/gpt-5.4-mini:low` (and `tools: Read, Grep, Glob` for `--read-only`). Add `--user` to write `~/.claude/agents/fast.md` instead. Claude Code may list a new file only after a restart. |
+| `/pi profile rm fast [--user]` / `/pi profile list` | Removes a pi agent file (never one on a Claude model), or lists them. |
 | `/pi fallback add openai/gpt-5.4-mini` | Adds a fallback model for stalled runs (`rm <ref>`, `clear`, `list`). |
 
 Model references use `provider/model[:thinking]`, the same format as `pi --model`. Settings persist across sessions. The status line shows the current default (`π openai/gpt-5.5`).
@@ -97,25 +140,27 @@ To make stalls rarer in the first place, tell OpenRouter how to pick upstream pr
 
 The plugin is a Claude Code hooks module (`hooks/register.tsx`). The pure logic (argv, the event stream, the background decision, watchdogs, error messages) lives in `hooks/pi.ts`.
 
-1. **Agent types.** `$.agent.register` declares `pi:agent`, `pi:explore` and your profiles, so they appear in Claude's agent listing like built-in agent types.
-2. **Dispatch.** A `tool.call` hook on `Agent` handles every `pi:*` call. It decides foreground or background (the `background` option), then runs `pi --print --mode json --session-dir <temp> …` through `$.process.spawn` and folds pi's JSON event stream into a run tally (tool calls, tokens, cost, the final message).
+1. **Agent types.** `$.agent.register` declares `pi:agent` and `pi:explore`, so they appear in Claude's agent listing like built-in agent types. Agent files are Claude Code's own: it lists them itself.
+2. **Dispatch.** A `tool.call` hook on `Agent` handles every `pi:*` call and every call whose agent file has a `pi:` model. It finds that file the way Claude Code does (the project's folders closest first, then `~/.claude/agents/`, with `agent.offer` telling it which scope the listed agent came from), maps its fields onto pi's flags, and decides foreground or background (the `background` option). It then runs `pi --print --mode json --session-dir <temp> …` through `$.process.spawn` and folds pi's JSON event stream into a run tally (tool calls, tokens, cost, the final message). An `agent.spawn` hook refuses pi agents started any other way.
 3. **Result.** A foreground run returns a real `Agent` `completed` record (`resolvedModel: "pi:<provider>/<model>"`, token usage, tool stats), so Claude Code treats the report like any other subagent's. A background run returns `async_launched` with an `outputFile` at once, writes progress to that file every few seconds, and submits a `<task-notification>` with the final report (or the error) when pi ends.
 4. **Live row.** A `ui.render` hook on the `Agent` tool row draws pi's tool calls, tokens, cost and elapsed time while a foreground run is in progress. The row redraws at least once a second even when pi prints nothing (a long model turn with no tool calls), so the elapsed time keeps ticking. Once the run finishes, the native row takes over.
 5. **Watchdogs.** On the same one-second beat the bridge checks three limits: no pi JSON event while pi waits on the model for `stallTimeoutSec` (default 90 s), no event while a pi tool runs for `idleTimeoutSec` (default 180 s), and a wall-clock cap of `maxRunMinutes` (default 30 min). A stall, or a transient provider error, is retried by forking the run's pi session (see [Stalled providers](#stalled-providers-openrouter)). Anything else, or a stall that outlasts the retries, kills pi and returns an error with the model, the elapsed time, the partial tally, the last tool step, the earlier attempts and the last 5 lines of pi's stderr. A stuck run never just hangs.
 6. **Errors.** The error says which way the run ended: interrupted by the user (Esc), stopped by a watchdog (stall, idle or wall-clock), a provider/model error from pi (unknown model, 4xx, rate limits), a bad pi exit, or pi not starting at all. Each comes with a hint on what to do next.
 7. **Esc** interrupts a foreground run and kills the pi process.
 
-By default pi runs isolated (`--no-extensions --no-skills --no-prompt-templates --no-themes`) so packages you use in interactive pi don't hijack subagent runs. pi still reads `AGENTS.md`/`CLAUDE.md`. Turn this off with the `isolate` option.
+By default pi runs isolated (`--no-extensions --no-skills --no-prompt-templates --no-themes`) so packages you use in interactive pi don't hijack subagent runs. pi's built-in MCP support is loaded back by name (`-e builtin:mcp -e builtin:codemode -e builtin:tool-search`) for runs that may use MCP, and turned off with `--no-mcp` for the rest. pi still reads `AGENTS.md`/`CLAUDE.md` unless the agent file sets `omitClaudeMd`. Turn isolation off with the `isolate` option.
 
 ## Caveats
 
-- pi runs its own tools, so **Claude Code's permission prompts don't apply inside a pi subagent**. Use `pi:explore` or a `--read-only` profile when you want a run that can't change anything. This matters more for background runs, which nobody watches.
+- pi runs its own tools, so **Claude Code's permission prompts don't apply inside a pi subagent**, and an agent file's `permissionMode` and `hooks` are not applied. Use `pi:explore`, or an agent file whose `tools` are read-only (`Read, Grep, Glob`), when you want a run that can't change anything. This matters more for background runs, which nobody watches, and for agent files that come with a repository you cloned.
 - A foreground pi call blocks Claude's turn until pi finishes, and parallel foreground calls block it until the slowest one ends. The live rows keep ticking, but for long work prefer background runs.
 - With `background: "auto"`, a session whose Agent tool lacks `run_in_background` runs **every** pi call in the background, short ones included. That costs an extra round trip for a quick lookup. Set `background: "never"` to opt out.
 - The stall watchdog can stop a model that legitimately thinks in silence for more than 90 s. The run is resumed rather than lost, and each retry waits twice as long, but the silent thinking is redone. Raise `stallTimeoutSec` for such models.
 - A resumed run starts a new pi session, so the provider's prompt cache starts cold and the retry re-reads the conversation so far. A tool call that was cut off has no result in the session; pi tells the model, which checks its effect before running it again.
 - Background runs aren't tied to Esc. Only the watchdogs (or the session ending) stop them.
 - `isolation: "worktree"` and `SendMessage` follow-ups aren't supported for pi agents.
+- An agent file's `mcpServers` isn't applied: pi agents use pi's own MCP servers (`pi mcp add`).
+- A pi agent file only runs through the Agent tool: workflows, teammates and `claude --agent` can't run it on pi.
 - `pi --list-models` only lists providers pi can see. Sign in with pi first.
 
 ## Development
@@ -125,4 +170,4 @@ claude plugin validate .
 claude plugin test .
 ```
 
-Tests live in `tests/`. `tests/pi.test.ts` covers the pure logic: stream, argv, options, the background decision, watchdogs and failure messages. `tests/register.test.tsx` drives the hooks against the engine's test kit, with fake `pi` processes behind `process.spawn` on a mocked clock: slow, silent, hung, stalled-then-resumed, failing-over and parallel runs.
+Tests live in `tests/`. `tests/pi.test.ts` covers the pure logic: stream, argv, options, the background decision, watchdogs and failure messages. `tests/agents.test.ts` covers agent files: frontmatter, the field and tool mapping, which file wins, and the files `/pi profile` writes. `tests/register.test.tsx` drives the hooks against the engine's test kit, with fake `pi` processes behind `process.spawn` on a mocked clock (slow, silent, hung, stalled-then-resumed, failing-over and parallel runs) and agent files in an in-memory file system.

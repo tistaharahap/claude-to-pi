@@ -60,20 +60,19 @@ test('pi --list-models output becomes rows and filters by words', async () => {
   expect(filterModels(rows, 'router coder').map(r => r.model)).toEqual(['qwen/qwen3-coder'])
 })
 
-test('a run is planned from profile, then tier, then default; effort sets thinking', async () => {
+test('a built-in run is planned from the tier, then the default; effort sets thinking', async () => {
   const settings = {
     ...EMPTY_SETTINGS,
     defaultModel: { provider: 'openai', model: 'gpt-5.5' },
     tiers: { haiku: { provider: 'openai', model: 'gpt-5.4-mini' } },
-    profiles: [{ name: 'qwen', model: { provider: 'openrouter', model: 'qwen/qwen3-coder' }, readOnly: true }],
   }
   expect(planRun(settings, 'agent')?.model).toEqual({ provider: 'openai', model: 'gpt-5.5' })
   expect(planRun(settings, 'agent', 'haiku')?.model?.model).toBe('gpt-5.4-mini')
-  expect(planRun(settings, 'explore')?.readOnly).toBe(true)
-  expect(planRun(settings, 'qwen', 'haiku')?.model?.model).toBe('qwen/qwen3-coder')
-  expect(planRun(settings, 'qwen')?.readOnly).toBe(true)
+  expect(planRun(settings, 'agent')?.mcp).toBe(true)
+  expect(planRun(settings, 'explore')).toMatchObject({ readOnly: true, tools: ['read', 'grep', 'find', 'ls'], mcp: false })
   expect(planRun(settings, 'agent', undefined, 'high')?.model?.thinking).toBe('high')
-  expect(planRun(settings, 'nope')).toBeUndefined()
+  // Agent files plan their own runs.
+  expect(planRun(settings, 'qwen')).toBeUndefined()
 })
 
 test('argv asks pi for JSON, no session, the model and read-only tools', async () => {

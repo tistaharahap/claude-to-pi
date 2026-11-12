@@ -75,7 +75,7 @@ Claude Code reads agent files from `.claude/agents/` in the project (and its par
 
 **Only through the Agent tool.** A pi agent started any other way (a workflow script's `agent()`, a teammate, another plugin's spawn) is refused with a message that says to use the Agent tool. `claude --agent <name>` (a pi agent as the main session) is not supported and fails as above.
 
-`/pi profile add` writes these files for you (next section). `/pi status` and `/pi profile list` list the pi agent files and warn about fields pi won't apply. Profiles from earlier versions of the plugin are moved to `~/.claude/agents/<name>.md` the first time a session starts, and calls to `pi:<name>` still reach them.
+To design one with Claude, ask for it ("make me a pi agent that reviews migrations like …"). The `creating-pi-agents` skill runs it as a brainstorming session: the job, then easy or advanced mode, then the persona's character, taste and conviction, and a model picked from what pi lists. It can model the agent on a real person or a blend of people, researching a public figure's published work and interviewing you about a private one. It shows you the full file and writes nothing until you say so. `/pi profile add` writes a minimal file for you (next section). `/pi status` and `/pi profile list` list the pi agent files and warn about fields pi won't apply. Profiles from earlier versions of the plugin are moved to `~/.claude/agents/<name>.md` the first time a session starts, and calls to `pi:<name>` still reach them.
 
 ## Options
 
@@ -93,7 +93,7 @@ Set these in the plugin's settings (`claude plugin configure pi`):
 
 **The `background` trade-off.** A foreground run hands its report straight back in the same turn, but it blocks that turn until pi finishes, and several parallel foreground runs block it until the slowest one ends. A background run frees the turn right away, but the report arrives later as a task notification, so Claude has to wait for it or carry on without it. In sessions where the Agent tool has no `run_in_background` parameter (some background jobs, or background tasks disabled), Claude can't ask for a background run. `auto` then assumes the run may be long and backgrounds it rather than silently blocking. The plugin reads this from the Agent tool's description, the only part of its schema a plugin can see. Use `never` if you'd rather keep results inline and watch the live rows, or `always` if every pi run should be a background task.
 
-The plugin also ships a skill, `using-pi-subagents`, that teaches Claude when to send work to pi and how to do it. It covers choosing a model with `/pi` (Claude can't pick a pi model through the Agent call), confirming the model that actually ran via `resolvedModel`, comparing several models side by side, and what pi agents don't support.
+The plugin also ships two skills. `creating-pi-agents` designs new pi agent files with you (see [Agent files on pi](#agent-files-on-pi)). `using-pi-subagents` teaches Claude when to send work to pi and how to do it. It covers choosing a model with `/pi` (Claude can't pick a pi model through the Agent call), confirming the model that actually ran via `resolvedModel`, comparing several models side by side, and what pi agents don't support.
 
 ## Choosing providers and models
 

@@ -25,6 +25,7 @@ The Agent tool's `model` parameter only accepts Claude aliases, so a pi model ca
 
 - Default for `pi:agent` and `pi:explore`: `/pi model openai/gpt-5.5`
 - A named agent type: `/pi profile add gpt55 openai/gpt-5.5 --read-only`, which writes `.claude/agents/gpt55.md` (`--user`: `~/.claude/agents/`) with `model: pi:openai/gpt-5.5`. Call it as `gpt55`. Claude Code may list a new file only after a restart. Use these when you need several models side by side.
+- A new agent with its own persona (a reviewer, a critic, one modeled on a real person): use the creating-pi-agents skill.
 - An existing agent file: its `model:` line picks the pi model. The user can change it with `/pi` (the picker lists agent files) or by editing the file.
 - A tier: `/pi tier haiku openai/gpt-5.4-mini`. After that, `model: "haiku"` on a pi type runs that model.
 - `/pi status` shows the current mapping. `/pi` opens a picker that lists every model pi can reach.

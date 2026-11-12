@@ -70,13 +70,29 @@ export function filterModels(rows: readonly PiModelRow[], filter: string): PiMod
 export type RunPlan = {
   agentType: string
   model?: PiModel
+  /** Whether the run can change nothing; adds the read-only brief. */
   readOnly: boolean
+  /** pi's tool allowlist (`--tools`); undefined: pi's defaults; empty: no tools. */
+  tools?: string[]
+  /** pi's tool denylist (`--exclude-tools`). */
+  excludeTools?: string[]
+  /** Whether pi's MCP servers connect (`--no-mcp` when false). */
+  mcp?: boolean
+  /** The agent's own instructions, appended after the subagent brief. */
+  prompt?: string
+  /** Leave out AGENTS.md / CLAUDE.md (`--no-context-files`). */
+  noContextFiles?: boolean
+  /** Stop the run after this many model turns, keeping what it has. */
+  maxTurns?: number
+  /** Lines the bridge appends to the report (fields pi did not apply). */
+  notes?: string[]
 }
 
 /**
- * Decides which model and tools a pi agent type runs with. Precedence for the
- * model: a profile's own model, then the Agent call's `model` alias mapped
- * through the tiers, then the default; the call's `effort` overrides thinking.
+ * Plans a run of a built-in pi agent type (`pi:agent`, `pi:explore`). The
+ * model is the Agent call's `model` alias mapped through the tiers, else the
+ * default; the call's `effort` overrides thinking. Agent files plan their own
+ * runs (see agents.ts).
  */
 export function planRun(
   settings: PiSettings,
@@ -84,15 +100,19 @@ export function planRun(
   alias?: string,
   effort?: string,
 ): RunPlan | undefined {
-  const profile = settings.profiles.find(p => p.name === agentName)
-  const isBuiltin = (BUILTIN_AGENTS as readonly string[]).includes(agentName)
-  if (profile === undefined && !isBuiltin) return undefined
+  if (!(BUILTIN_AGENTS as readonly string[]).includes(agentName)) return undefined
   const tier = alias !== undefined ? settings.tiers[alias as TierAlias] : undefined
-  let model = profile?.model ?? tier ?? settings.defaultModel
-  if (effort !== undefined && model !== undefined) model = { ...model, thinking: effort }
-  if (effort !== undefined && model === undefined) model = { provider: '', model: '', thinking: effort }
-  const readOnly = profile?.readOnly ?? agentName === 'explore'
-  return { agentType: `pi:${agentName}`, model, readOnly }
+  const model = withEffort(tier ?? settings.defaultModel, effort)
+  if (agentName === 'explore') {
+    return { agentType: 'pi:explore', ...(model !== undefined ? { model } : {}), readOnly: true, tools: READ_ONLY_TOOLS, mcp: false }
+  }
+  return { agentType: `pi:${agentName}`, ...(model !== undefined ? { model } : {}), readOnly: false, mcp: true }
+}
+
+/** A model with the call's effort as its thinking level; an effort alone keeps pi's default model. */
+export function withEffort(model: PiModel | undefined, effort?: string): PiModel | undefined {
+  if (effort === undefined) return model
+  return model !== undefined ? { ...model, thinking: effort } : { provider: '', model: '', thinking: effort }
 }
 
 export const SUBAGENT_BRIEF = [
@@ -111,6 +131,9 @@ export const READ_ONLY_BRIEF =
  * work done so far under a new session id. Without one the run is ephemeral.
  */
 export type SessionArgs = { dir: string; id?: string; fork?: string }
+
+/** pi's built-in extensions that serve MCP servers (codemode and tool search call their tools). */
+export const MCP_EXTENSIONS = ['builtin:mcp', 'builtin:codemode', 'builtin:tool-search']
 
 export function buildArgv(opts: {
   piPath: string
@@ -132,9 +155,23 @@ export function buildArgv(opts: {
     argv.push('--model', m.provider === '' ? m.model : `${m.provider}/${m.model}`)
   }
   if (m?.thinking !== undefined) argv.push('--thinking', m.thinking)
-  if (plan.readOnly) argv.push('--tools', READ_ONLY_TOOLS.join(','))
+  const tools = plan.tools ?? (plan.readOnly ? READ_ONLY_TOOLS : undefined)
+  if (tools !== undefined) {
+    if (tools.length === 0) argv.push('--no-tools')
+    else argv.push('--tools', tools.join(','))
+  }
+  if (plan.excludeTools !== undefined && plan.excludeTools.length > 0) argv.push('--exclude-tools', plan.excludeTools.join(','))
+  // Claude Code only runs in a folder its person trusted (or under -p, where
+  // trust is implied), so pi trusts the project's own files (.pi/) as well.
+  argv.push('--approve')
   if (isolate) argv.push('--no-extensions', '--no-skills', '--no-prompt-templates', '--no-themes')
-  argv.push('--append-system-prompt', plan.readOnly ? `${SUBAGENT_BRIEF}\n\n${READ_ONLY_BRIEF}` : SUBAGENT_BRIEF)
+  if (plan.mcp === false) argv.push('--no-mcp')
+  // Isolation drops pi's built-in extensions; MCP is one, so it comes back by name.
+  else if (plan.mcp === true && isolate) for (const ext of MCP_EXTENSIONS) argv.push('-e', ext)
+  if (plan.noContextFiles === true) argv.push('--no-context-files')
+  const brief = plan.readOnly ? `${SUBAGENT_BRIEF}\n\n${READ_ONLY_BRIEF}` : SUBAGENT_BRIEF
+  const own = plan.prompt?.trim() ?? ''
+  argv.push('--append-system-prompt', own === '' ? brief : `${brief}\n\n${own}`)
   argv.push('--', prompt)
   return argv
 }
@@ -167,6 +204,8 @@ export type RunTally = {
   sessionId?: string
   /** Whether this attempt's session holds any message yet (so it can be forked). */
   sawMessage: boolean
+  /** Model turns started, over every attempt. */
+  turns: number
 }
 
 export function newTally(): RunTally {
@@ -187,6 +226,7 @@ export function newTally(): RunTally {
     stats: { read: 0, search: 0, bash: 0, edit: 0, other: 0 },
     openTools: [],
     sawMessage: false,
+    turns: 0,
   }
 }
 
@@ -252,6 +292,9 @@ export function applyEvent(tally: RunTally, event: Json): RunTally {
   switch (event.type) {
     case 'session':
       if (str(event.id) !== '') tally.sessionId = str(event.id)
+      break
+    case 'turn_start':
+      tally.turns++
       break
     case 'tool_execution_start': {
       const tool = str(event.toolName)

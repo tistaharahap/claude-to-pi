@@ -9,9 +9,54 @@ function engine(on: On) {
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('agent.register', (_, e) => ({ value: { agent: `pi:${e.name}` } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/proj' }))
   on('ui.status', () => ({ value: undefined }))
   return mock.clock(on, { now: 1_000 })
 }
+
+/** A file system in memory: `files` maps absolute paths to their text. */
+function fakeFs(on: On, files: Record<string, string> = {}) {
+  const childrenOf = (dir: string) => {
+    const names = new Map<string, 'file' | 'dir'>()
+    for (const path of Object.keys(files)) {
+      if (!path.startsWith(`${dir}/`)) continue
+      const [head, ...tail] = path.slice(dir.length + 1).split('/')
+      if (head !== undefined) names.set(head, tail.length > 0 ? 'dir' : 'file')
+    }
+    return names
+  }
+  on('fs.read', (_, e) => {
+    const text = files[e.path]
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: text } as never
+  })
+  on('fs.write', (_, e) => {
+    files[e.path] = e.text
+    return { value: undefined }
+  })
+  on('fs.exists', (_, e) => ({ value: files[e.path] !== undefined || childrenOf(e.path).size > 0 }))
+  on('fs.list', (_, e) => {
+    const names = childrenOf(e.path)
+    if (names.size === 0) throw new Error(`ENOENT: ${e.path}`)
+    return {
+      value: [...names].map(([name, kind]) => ({ name, kind, size: 0, mtimeMs: 0, isLink: false })),
+    } as never
+  })
+  return files
+}
+
+/** A fake pi that prints the fixture run; `argvs` collects each run's argv. */
+function fakePi(on: On, lines: readonly string[] = FIXTURE_LINES) {
+  const argvs: string[][] = []
+  on('process.spawn', async function* (_, e) {
+    argvs.push([...e.argv])
+    yield { stream: 'stdout' as const, text: lines.join('\n') + '\n' }
+    return { value: { code: 0, signal: null } }
+  })
+  return argvs
+}
+
+const argOf = (argv: readonly string[], flag: string) => (argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined)
 
 test('a pi:* Agent call runs pi and answers with a completed Agent record', async ($, on) => {
   engine(on)
@@ -83,6 +128,7 @@ test('an unknown pi type is refused with the list of known ones', async ($, on) 
 test('/pi model, tier and profile commands persist settings', async ($, on) => {
   engine(on)
   mock.store(on)
+  fakeFs(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const pi = (args: string) =>
     $.command.run({
@@ -97,15 +143,15 @@ test('/pi model, tier and profile commands persist settings', async ($, on) => {
 
   await pi('tier haiku openai/gpt-5.4-mini')
   const added = await pi('profile add qwen openrouter/qwen/qwen3-coder --read-only Fast code search')
-  expect(added.text).toBe('Added subagent type pi:qwen → openrouter/qwen/qwen3-coder (read-only).')
+  expect(added.text).toContain('Wrote .claude/agents/qwen.md: the subagent type qwen runs on pi (openrouter/qwen/qwen3-coder), read-only.')
 
   const status = await pi('status')
   expect(status.text).toContain('pi:agent, pi:explore → openai/gpt-5.5:high')
   expect(status.text).toContain('Agent model "haiku" → openai/gpt-5.4-mini')
-  expect(status.text).toContain('pi:qwen → openrouter/qwen/qwen3-coder (read-only)')
+  expect(status.text).toContain('qwen → openrouter/qwen/qwen3-coder (read-only) · .claude/agents/qwen.md')
 
   const listed = await pi('profile list')
-  expect(listed.text).toBe('pi:qwen → openrouter/qwen/qwen3-coder (read-only)')
+  expect(listed.text).toBe('qwen → openrouter/qwen/qwen3-coder (read-only) · .claude/agents/qwen.md')
 })
 
 test('a background pi run launches at once, then reports back like a task', async ($, on) => {
@@ -925,3 +971,184 @@ test(
     expect(files[out]).toContain('## Retries')
   },
 )
+
+// ------------------------------------------------------------ agent files
+
+const REVIEWER_FILE = [
+  '---',
+  'name: reviewer',
+  'description: Reviews diffs for correctness bugs.',
+  'model: pi:openai/gpt-5.5',
+  'effort: high',
+  'tools: Read, Grep, WebFetch',
+  'skills: [checklist]',
+  'mcpServers:',
+  '  - github',
+  '---',
+  'You are a strict reviewer.',
+].join('\n')
+
+test('an agent file with a pi model runs on pi under its own name', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  mock.env(on, { HOME: '/home/u' })
+  fakeFs(on, {
+    '/proj/.claude/agents/review/reviewer.md': REVIEWER_FILE,
+    '/home/u/.claude/skills/checklist/SKILL.md': '---\nname: checklist\n---\n1. Check the null paths.',
+  })
+  const argvs = fakePi(on)
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Agent', description: 'Review', prompt: 'review the diff', subagent_type: 'reviewer' })
+
+  expect(ran.deny).toBeUndefined()
+  const record = ran.result as { agentType: string; resolvedModel: string; content: { text: string }[] }
+  expect(record.agentType).toBe('reviewer')
+  expect(record.resolvedModel).toBe('pi:openai/gpt-4.1-mini')
+  const text = record.content[0]?.text ?? ''
+  expect(text).toContain('Found 2 files. DONE')
+  expect(text).toContain('tools with no pi equivalent were left out: WebFetch')
+  expect(text).toContain('add them with `pi mcp add`')
+
+  const argv = argvs[0] ?? []
+  expect(argOf(argv, '--model')).toBe('openai/gpt-5.5')
+  expect(argOf(argv, '--thinking')).toBe('high')
+  expect(argOf(argv, '--tools')).toBe('read,grep')
+  expect(argv).toContain('--no-mcp')
+  expect(argv).toContain('--approve')
+  const system = argOf(argv, '--append-system-prompt') ?? ''
+  expect(system).toContain('You are a strict reviewer.')
+  expect(system).toContain('# Skill: checklist')
+  expect(system).toContain('1. Check the null paths.')
+})
+
+test('an agent file without tools gets pi’s MCP servers; the call’s effort wins', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  fakeFs(on, { '/proj/.claude/agents/doer.md': '---\nname: doer\ndescription: Does.\nmodel: pi:openrouter/qwen/qwen3-coder:low\n---\nDo it.' })
+  const argvs = fakePi(on)
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Agent', description: 'Do', prompt: 'do', subagent_type: 'doer', effort: 'max' } as never)
+  expect(ran.deny).toBeUndefined()
+  const argv = argvs[0] ?? []
+  expect(argOf(argv, '--model')).toBe('openrouter/qwen/qwen3-coder')
+  expect(argOf(argv, '--thinking')).toBe('max')
+  expect(argv).not.toContain('--tools')
+  expect(argv).not.toContain('--no-mcp')
+  expect(argv.join(' ')).toContain('-e builtin:mcp')
+})
+
+test('agent files on Claude models and unknown names go to Claude Code', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  fakeFs(on, { '/proj/.claude/agents/c.md': '---\nname: claudey\ndescription: x\nmodel: sonnet\n---\nHi' })
+  const argvs = fakePi(on)
+  on('tool.call', () => ({ result: 'claude ran it' }))
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  expect((await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'claudey' })).result).toBe('claude ran it')
+  expect((await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'nobody' })).result).toBe('claude ran it')
+  expect(argvs).toHaveLength(0)
+})
+
+test('a pi agent started outside the Agent tool is refused; others spawn', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  fakeFs(on, { '/proj/.claude/agents/reviewer.md': REVIEWER_FILE })
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'a1' }) as never)
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  // The kit fills the spawn's pinned fields (provider, parentModel, ...).
+  const spawn = (subagentType: string) => $.agent.spawn({ subagentType, prompt: 'x' } as never)
+  const refused = await spawn('reviewer')
+  expect(refused.deny).toContain('only the Agent tool can start a pi agent')
+  const builtin = await spawn('pi:agent')
+  expect(builtin.deny).toContain('runs on pi')
+  const other = await spawn('Explore')
+  expect(other.deny).toBeUndefined()
+})
+
+test('an agent file asking for worktree isolation is refused with the file named', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  fakeFs(on, { '/proj/.claude/agents/w.md': '---\nname: w\ndescription: x\nmodel: pi:a/b\nisolation: worktree\n---\n' })
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'w' })
+  expect(ran.deny).toContain('does not support isolation "worktree" (set in /proj/.claude/agents/w.md)')
+})
+
+test('maxTurns stops the run and keeps the answer so far', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  fakeFs(on, { '/proj/.claude/agents/brief.md': '---\nname: brief\ndescription: x\nmodel: pi:openai/gpt-4.1-mini\nmaxTurns: 1\n---\n' })
+  const turn = (text: string) => [
+    JSON.stringify({ type: 'turn_start' }),
+    JSON.stringify({
+      type: 'message_end',
+      message: { role: 'assistant', content: [{ type: 'text', text }], provider: 'openai', model: 'gpt-4.1-mini', usage: {}, stopReason: 'stop' },
+    }),
+  ]
+  fakePi(on, [...turn('first'), ...turn('second'), ...turn('third')])
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'brief' })
+  expect(ran.deny).toBeUndefined()
+  const text = (ran.result as { content: { text: string }[] }).content[0]?.text ?? ''
+  expect(text).toContain('first')
+  expect(text).not.toContain('second')
+  expect(text).toContain("stopped at the agent's maxTurns (1)")
+})
+
+test('/pi profile add --user writes to ~/.claude/agents; rm removes only pi agent files', async ($, on) => {
+  engine(on)
+  mock.store(on)
+  mock.env(on, { HOME: '/home/u' })
+  const files = fakeFs(on, { '/proj/.claude/agents/mine.md': '---\nname: mine\ndescription: x\nmodel: opus\n---\n' })
+  on('process.run', (_, e) => {
+    const path = e.argv[e.argv.length - 1] ?? ''
+    delete files[path]
+    return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
+  })
+  const pi = (args: string) =>
+    $.command.run({ command: 'pi', args, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 120 } })
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  const added = await pi('profile add fast openai/gpt-5.4-mini:low --user Quick lookups')
+  expect(added.text).toContain('Wrote ~/.claude/agents/fast.md')
+  expect(files['/home/u/.claude/agents/fast.md']).toContain('model: pi:openai/gpt-5.4-mini:low')
+  expect(files['/home/u/.claude/agents/fast.md']).toContain('description: Quick lookups. Runs on pi (openai/gpt-5.4-mini:low).')
+
+  expect((await pi('profile add fast openai/gpt-5.5 --user')).text).toContain('already exists')
+  expect((await pi('profile rm mine')).text).toContain('is not a pi agent')
+  expect(files['/proj/.claude/agents/mine.md']).toBeDefined()
+  expect((await pi('profile rm fast')).text).toContain('Removed ~/.claude/agents/fast.md')
+  expect(files['/home/u/.claude/agents/fast.md']).toBeUndefined()
+})
+
+test('stored profiles move to ~/.claude/agents once, and pi:<name> still reaches them', async ($, on) => {
+  engine(on)
+  mock.store(on, {
+    settings: {
+      tiers: {},
+      profiles: [{ name: 'qwen', model: { provider: 'openrouter', model: 'qwen/qwen3-coder' }, readOnly: true }],
+    },
+  })
+  mock.env(on, { HOME: '/home/u' })
+  const files = fakeFs(on)
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  const argvs = fakePi(on)
+
+  await $.session.start({ cwd: '/proj', surface: 'terminal', isInteractive: true })
+  expect(files['/home/u/.claude/agents/qwen.md']).toContain('model: pi:openrouter/qwen/qwen3-coder')
+  expect(toasts[0]).toContain('moved qwen to ~/.claude/agents/')
+
+  const ran = await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:qwen' })
+  expect(ran.deny).toBeUndefined()
+  expect((ran.result as { agentType: string }).agentType).toBe('qwen')
+  expect(argOf(argvs[0] ?? [], '--tools')).toBe('read,grep,find,ls')
+})

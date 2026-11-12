@@ -5,7 +5,10 @@ export type PiModel = {
   thinking?: string
 }
 
-/** A named pi agent type the person defined with `/pi profile add`. */
+/**
+ * A pi agent type from before agent files: kept only so profiles stored by an
+ * earlier version can be moved to `~/.claude/agents/<name>.md`.
+ */
 export type PiProfile = {
   name: string
   model: PiModel
@@ -19,6 +22,7 @@ export type PiSettings = {
   defaultModel?: PiModel
   /** Claude's Agent `model` aliases mapped onto pi models. */
   tiers: Partial<Record<'haiku' | 'sonnet' | 'opus' | 'fable', PiModel>>
+  /** Profiles stored by an earlier version; moved to agent files at session start. */
   profiles: PiProfile[]
   /**
    * Models a stalled or failing run moves to, in order, from its second retry
@@ -55,6 +59,17 @@ export type PiRun = {
   notice?: string
 }
 
+/** A pi agent from a Claude Code agent file (`model: pi:…`), as `/pi` lists it. */
+export type PiAgentSummary = {
+  name: string
+  model: PiModel
+  scope: 'project' | 'user'
+  path: string
+  readOnly: boolean
+  /** Fields pi does not apply, and other things worth knowing about the file. */
+  warnings: string[]
+}
+
 /** A row of `pi --list-models`. */
 export type PiModelRow = {
   provider: string
@@ -80,6 +95,8 @@ declare module 'claude-code' {
       runs: Shaped<Record<string, PiRun>>
       picker: Shaped<PiPicker>
       host: Shaped<{ agentExposesBackground?: boolean }>
+      agents: Shaped<{ list: PiAgentSummary[] }>
+      offers: Shaped<Record<string, string>>
     }
   }
 }

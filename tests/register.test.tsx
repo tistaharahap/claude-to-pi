@@ -615,3 +615,313 @@ test(
     expect((ran.result as { status: string }).status).toBe('completed')
   },
 )
+
+// ------------------------------------------------ stalled providers
+
+const sessionHeader = (id: string) => JSON.stringify({ type: 'session', version: 3, id, cwd: '/' })
+const userMessage = JSON.stringify({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'go' }] } })
+
+type Script =
+  | { kind: 'stall'; tool?: boolean }
+  | { kind: 'answer'; text: string }
+  | { kind: 'error'; message: string }
+
+/**
+ * A pi whose attempts follow `script`, one entry per spawn: `stall` writes its
+ * session and a tool step, then goes silent until killed; `answer` finishes;
+ * `error` ends on a provider error. Each attempt's session id is `s<n>`.
+ */
+function scriptedPi(on: On, script: Script[]) {
+  const spawned: string[][] = []
+  const killed: number[] = []
+  on('process.spawn', async function* (_, e, next) {
+    const n = spawned.length
+    spawned.push([...e.argv])
+    const step = script[Math.min(n, script.length - 1)] ?? { kind: 'answer', text: 'DONE' }
+    yield { stream: 'stdout' as const, text: `${sessionHeader(`s${n + 1}`)}\n${userMessage}\n` }
+    if (step.kind === 'stall') {
+      yield { stream: 'stdout' as const, text: `${toolStart(n + 1)}\n${step.tool === true ? '' : `${toolEnd(n + 1)}\n`}` }
+      try {
+        await new Promise<void>(resolve => {
+          if (next.signal.aborted) resolve()
+          next.signal.addEventListener('abort', () => resolve())
+        })
+      } finally {
+        killed.push(n + 1)
+      }
+      return { value: { code: null, signal: 'SIGTERM' } }
+    }
+    if (step.kind === 'error') {
+      yield {
+        stream: 'stdout' as const,
+        text: `${JSON.stringify({
+          type: 'message_end',
+          message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: step.message, usage: {} },
+        })}\n`,
+      }
+      return { value: { code: 1, signal: null } }
+    }
+    yield { stream: 'stdout' as const, text: `${finalAnswer(step.text)}\n` }
+    return { value: { code: 0, signal: null } }
+  })
+  return { spawned, killed }
+}
+
+const argAfter = (argv: readonly string[] | undefined, flag: string) =>
+  argv === undefined || !argv.includes(flag) ? undefined : argv[argv.indexOf(flag) + 1]
+
+test(
+  'a stalled provider is dropped and the run resumes by forking its pi session',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on, { settings: { defaultModel: { provider: 'openrouter', model: 'qwen/qwen3-coder' }, tiers: {}, profiles: [] } })
+    mock.env(on, { TMPDIR: '/tmp/' })
+    const removed: string[][] = []
+    on('process.run', (_, e) => {
+      removed.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
+    })
+    const pi = scriptedPi(on, [{ kind: 'stall' }, { kind: 'answer', text: 'resumed DONE' }])
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({
+      tool: 'Agent',
+      description: 'Review toolu_r',
+      prompt: 'review the repo',
+      subagent_type: 'pi:explore',
+      tool_use_id: 'toolu_r',
+    } as never)
+    await clock.settle()
+    const ui = await mountRow($, 'toolu_r')
+    await clock.advance(60_000)
+    expect(pi.spawned.length).toBe(1)
+    await clock.advance(31_000)
+    await clock.settle()
+    expect(pi.killed).toEqual([1])
+    expect(pi.spawned.length).toBe(2)
+    const ran = await call
+    expect(ran.deny).toBeUndefined()
+
+    const [first, second] = pi.spawned
+    const dir = argAfter(first, '--session-dir')
+    expect(dir).toMatch(/^\/tmp\/claude-pi\/sessions\/pi-[\w-]+$/)
+    expect(first).not.toContain('--no-session')
+    expect(argAfter(first, '--session-id')).toBeDefined()
+    expect(first?.at(-1)).toBe('review the repo')
+    expect(argAfter(second, '--session-dir')).toBe(dir)
+    expect(argAfter(second, '--fork')).toBe('s1')
+    expect(argAfter(second, '--model')).toBe('openrouter/qwen/qwen3-coder')
+    expect(second?.at(-1)).toContain('Continue the task from where it stopped')
+
+    const text = (ran.result as { content: { text: string }[] }).content[0]?.text ?? ''
+    expect(text).toContain('resumed DONE')
+    expect(text).toContain('attempt 1 on openrouter/qwen/qwen3-coder: stalled (no events for 1m 30s')
+    expect(removed).toEqual([['rm', '-rf', dir ?? '']])
+    await ui.unmount()
+  },
+)
+
+test(
+  'the live row says the provider stalled while the retry runs',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on)
+    const pi = scriptedPi(on, [{ kind: 'stall' }, { kind: 'stall' }, { kind: 'answer', text: 'x' }])
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({
+      tool: 'Agent',
+      description: 'Review toolu_n',
+      prompt: 'review the repo',
+      subagent_type: 'pi:explore',
+      tool_use_id: 'toolu_n',
+    } as never)
+    await clock.settle()
+    const ui = await mountRow($, 'toolu_n')
+    await clock.advance(92_000)
+    expect(JSON.stringify(await ui.drawn())).toContain('provider stalled · retry 1/2')
+    // The second attempt gets twice the stall limit.
+    await clock.advance(170_000)
+    expect(pi.spawned.length).toBe(2)
+    await clock.advance(12_000)
+    await clock.settle()
+    expect(pi.spawned.length).toBe(3)
+    expect(argAfter(pi.spawned[2], '--fork')).toBe('s2')
+    await ui.unmount()
+    expect((await call).deny).toBeUndefined()
+  },
+)
+
+test(
+  'later retries move to the fallback models',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on, {
+      settings: {
+        defaultModel: { provider: 'openrouter', model: 'qwen/qwen3-coder', thinking: 'high' },
+        tiers: {},
+        profiles: [],
+        fallbacks: [{ provider: 'openai', model: 'gpt-5.4-mini' }],
+      },
+    })
+    const pi = scriptedPi(on, [{ kind: 'stall' }, { kind: 'stall' }, { kind: 'answer', text: 'fallback DONE' }])
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    await clock.settle()
+    await clock.advance(91_000 + 181_000 + 5_000)
+    const ran = await call
+    expect(ran.deny).toBeUndefined()
+    expect(pi.spawned.map(a => argAfter(a, '--model'))).toEqual([
+      'openrouter/qwen/qwen3-coder',
+      'openrouter/qwen/qwen3-coder',
+      'openai/gpt-5.4-mini',
+    ])
+    expect(argAfter(pi.spawned[2], '--thinking')).toBe('high')
+    expect((ran.result as { content: { text: string }[] }).content[0]?.text).toContain('finished on openrouter/deepseek/deepseek-v4.1-flash')
+  },
+)
+
+test(
+  'a provider that keeps stalling fails after the retries, with the history and how to resume',
+  { timeoutMs: 60_000, options: { stallRetries: 1, stallTimeoutSec: 30 } },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on, { settings: { defaultModel: { provider: 'openrouter', model: 'qwen/qwen3-coder' }, tiers: {}, profiles: [] } })
+    mock.env(on, { TMPDIR: '/tmp/' })
+    const removed: string[][] = []
+    on('process.run', (_, e) => {
+      removed.push([...e.argv])
+      return { value: { exitCode: 0, stdout: '', stderr: '' } } as never
+    })
+    const pi = scriptedPi(on, [{ kind: 'stall' }])
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    await clock.settle()
+    await clock.advance(31_000 + 61_000)
+    const ran = await call
+    await clock.settle()
+    expect(pi.spawned.length).toBe(2)
+    expect(pi.killed).toEqual([1, 2])
+    expect(ran.deny).toContain('on attempt 2 of 2')
+    expect(ran.deny).toContain('the model sent nothing for 1m 0s')
+    expect(ran.deny).toContain('attempt 1 on openrouter/qwen/qwen3-coder: stalled')
+    expect(ran.deny).toContain('--fork s2')
+    expect(ran.deny).toContain('/pi fallback add')
+    // The failed run's sessions are kept for the person to resume.
+    expect(removed).toEqual([])
+  },
+)
+
+test(
+  'stallRetries 0 fails on the first stall',
+  { timeoutMs: 60_000, options: { stallRetries: 0 } },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on)
+    const pi = scriptedPi(on, [{ kind: 'stall' }])
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    await clock.settle()
+    await clock.advance(91_000)
+    const ran = await call
+    expect(pi.spawned.length).toBe(1)
+    expect(ran.deny).toContain('stall limit')
+    expect(ran.deny).not.toContain('attempt 1 of')
+  },
+)
+
+test(
+  'a transient provider error is retried; a permanent one is not',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on)
+    const pi = scriptedPi(on, [
+      { kind: 'error', message: '502 Provider returned error' },
+      { kind: 'answer', text: 'after 502 DONE' },
+      { kind: 'error', message: '401 Unauthorized' },
+    ])
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const ok = await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    expect(ok.deny).toBeUndefined()
+    expect(pi.spawned.length).toBe(2)
+    expect(argAfter(pi.spawned[1], '--fork')).toBe('s1')
+    const text = (ok.result as { content: { text: string }[] }).content[0]?.text ?? ''
+    expect(text).toContain('after 502 DONE')
+    expect(text).toContain('provider error: 502 Provider returned error')
+
+    const bad = await $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    expect(pi.spawned.length).toBe(3)
+    expect(bad.deny).toContain('401 Unauthorized')
+    expect(bad.deny).toContain('pi auth check')
+    await clock.settle()
+  },
+)
+
+test(
+  'a long silent tool is not a stall: only the idle limit applies to it',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on)
+    const spawned: string[][] = []
+    on('process.spawn', async function* (_, e) {
+      spawned.push([...e.argv])
+      yield { stream: 'stdout' as const, text: `${sessionHeader('s1')}\n${userMessage}\n${toolStart(1)}\n` }
+      await clock.sleep(150_000)
+      yield { stream: 'stdout' as const, text: `${toolEnd(1)}\n${finalAnswer('built DONE')}\n` }
+      return { value: { code: 0, signal: null } }
+    })
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const call = $.tool.call({ tool: 'Agent', description: 'x', prompt: 'x', subagent_type: 'pi:agent' })
+    await clock.settle()
+    await clock.advance(151_000)
+    const ran = await call
+    expect(spawned.length).toBe(1)
+    expect((ran.result as { content: { text: string }[] }).content[0]?.text).toBe('built DONE')
+  },
+)
+
+test(
+  'a background run that recovers from a stall says so in its notification',
+  { timeoutMs: 60_000 },
+  async ($, on) => {
+    const clock = engine(on)
+    mock.store(on)
+    mock.env(on, { TMPDIR: '/tmp/' })
+    const files: Record<string, string> = {}
+    on('fs.write', (_, e) => {
+      files[e.path] = e.text
+      return { value: undefined }
+    })
+    on('ui.toast', () => ({ value: undefined }))
+    const notices: string[] = []
+    on('prompt.submit', (_, e) => {
+      notices.push(e.text)
+      return { text: e.text }
+    })
+    scriptedPi(on, [{ kind: 'stall' }, { kind: 'answer', text: 'bg DONE' }])
+
+    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+    const ran = await $.tool.call({
+      tool: 'Agent',
+      description: 'x',
+      prompt: 'x',
+      subagent_type: 'pi:agent',
+      run_in_background: true,
+    } as never)
+    const out = (ran.result as { outputFile: string }).outputFile
+    await clock.settle()
+    await clock.advance(95_000)
+    await clock.settle()
+    expect(notices.length).toBe(1)
+    expect(notices[0]).toContain('bg DONE')
+    expect(notices[0]).toContain('stalled')
+    expect(files[out]).toContain('## Retries')
+  },
+)

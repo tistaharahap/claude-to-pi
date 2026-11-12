@@ -105,14 +105,28 @@ export const SUBAGENT_BRIEF = [
 export const READ_ONLY_BRIEF =
   'You are in read-only mode: investigate and report; do not attempt to modify files.'
 
+/**
+ * Where a run keeps its pi session. A fresh attempt names its own session
+ * `id`; a retry `fork`s the session an earlier attempt left, which keeps the
+ * work done so far under a new session id. Without one the run is ephemeral.
+ */
+export type SessionArgs = { dir: string; id?: string; fork?: string }
+
 export function buildArgv(opts: {
   piPath: string
   plan: RunPlan
   prompt: string
   isolate: boolean
+  session?: SessionArgs
 }): string[] {
-  const { piPath, plan, prompt, isolate } = opts
-  const argv = [piPath, '--print', '--mode', 'json', '--no-session']
+  const { piPath, plan, prompt, isolate, session } = opts
+  const argv = [piPath, '--print', '--mode', 'json']
+  if (session === undefined) argv.push('--no-session')
+  else {
+    argv.push('--session-dir', session.dir)
+    if (session.fork !== undefined) argv.push('--fork', session.fork)
+    else if (session.id !== undefined) argv.push('--session-id', session.id)
+  }
   const m = plan.model
   if (m !== undefined && m.model !== '') {
     argv.push('--model', m.provider === '' ? m.model : `${m.provider}/${m.model}`)
@@ -147,6 +161,12 @@ export type RunTally = {
   error?: string
   isSettled: boolean
   stats: { read: number; search: number; bash: number; edit: number; other: number }
+  /** Tool calls started and not yet ended in this attempt: pi is running a tool, not waiting on the model. */
+  openTools: string[]
+  /** The pi session this attempt writes, from pi's `session` header. */
+  sessionId?: string
+  /** Whether this attempt's session holds any message yet (so it can be forked). */
+  sawMessage: boolean
 }
 
 export function newTally(): RunTally {
@@ -165,7 +185,32 @@ export function newTally(): RunTally {
     tail: '',
     isSettled: false,
     stats: { read: 0, search: 0, bash: 0, edit: 0, other: 0 },
+    openTools: [],
+    sawMessage: false,
   }
+}
+
+/**
+ * Readies a tally for another attempt of the same run. Counts, tokens, cost
+ * and steps carry over; the answer, the error and the session start again.
+ * Steps the killed attempt left running are marked failed.
+ */
+export function beginAttempt(tally: RunTally): RunTally {
+  for (const id of tally.openTools) {
+    const step = tally.steps[tally.pending[id] ?? -1]
+    if (step !== undefined && !step.isDone) {
+      step.isDone = true
+      step.isError = true
+    }
+  }
+  tally.openTools = []
+  tally.finalText = ''
+  tally.tail = ''
+  tally.error = undefined
+  tally.isSettled = false
+  tally.sessionId = undefined
+  tally.sawMessage = false
+  return tally
 }
 
 function str(v: unknown): string {
@@ -205,9 +250,13 @@ function textOf(content: unknown): string {
 /** Folds one parsed JSON event into the tally (mutates and returns it). */
 export function applyEvent(tally: RunTally, event: Json): RunTally {
   switch (event.type) {
+    case 'session':
+      if (str(event.id) !== '') tally.sessionId = str(event.id)
+      break
     case 'tool_execution_start': {
       const tool = str(event.toolName)
       tally.pending[str(event.toolCallId)] = tally.steps.length
+      tally.openTools.push(str(event.toolCallId))
       tally.steps.push({ tool, summary: summarizeCall(tool, event.args), isDone: false, isError: false })
       tally.toolCount++
       if (!tally.toolsUsed.includes(tool)) tally.toolsUsed.push(tool)
@@ -215,6 +264,7 @@ export function applyEvent(tally: RunTally, event: Json): RunTally {
       break
     }
     case 'tool_execution_end': {
+      tally.openTools = tally.openTools.filter(id => id !== str(event.toolCallId))
       const at = tally.pending[str(event.toolCallId)]
       const step = at === undefined ? undefined : tally.steps[at]
       if (step !== undefined) {
@@ -230,6 +280,7 @@ export function applyEvent(tally: RunTally, event: Json): RunTally {
     }
     case 'message_end': {
       const msg = event.message as Json | undefined
+      if (msg !== undefined) tally.sawMessage = true
       if (msg?.role !== 'assistant') break
       const usage = (msg.usage ?? {}) as Json
       tally.input += Number(usage.input ?? 0)
@@ -294,11 +345,14 @@ export function agentRecord(opts: {
   prompt: string
   tally: RunTally
   durationMs: number
+  /** A line from the bridge appended to the report, e.g. that the run recovered from a stall. */
+  note?: string
 }) {
-  const { agentId, agentType, prompt, tally, durationMs } = opts
+  const { agentId, agentType, prompt, tally, durationMs, note } = opts
   const model = tally.models[tally.models.length - 1]
-  const text =
+  const answer =
     tally.finalText.trim() === '' ? '(pi finished without a final message)' : tally.finalText
+  const text = note === undefined ? answer : `${answer}\n\n${note}`
   return {
     status: 'completed' as const,
     // pi runs are one-shot (--no-session): there is no agent to SendMessage.
@@ -368,20 +422,34 @@ export type BackgroundMode = (typeof BACKGROUND_MODES)[number]
 
 export const DEFAULT_IDLE_TIMEOUT_SEC = 180
 export const DEFAULT_MAX_RUN_MINUTES = 30
+export const DEFAULT_STALL_TIMEOUT_SEC = 90
+export const DEFAULT_STALL_RETRIES = 2
 
-/** How long a run may go without a pi JSON event, and how long it may run at all. */
-export type RunLimits = { idleMs: number; wallMs: number }
+/**
+ * How long a run may stay silent and how long it may run at all.
+ * - `stallMs`: no pi event while pi waits on the model (a stalled provider).
+ * - `idleMs`: no pi event while one of pi's tools runs (a hung command).
+ * - `wallMs`: the whole run, retries included.
+ */
+export type RunLimits = { idleMs: number; wallMs: number; stallMs: number }
 
 export type PluginSettings = {
   piPath: string
   isolate: boolean
   background: BackgroundMode
   limits: RunLimits
+  /** How many times a stalled run is resumed in a fresh pi session before it fails. */
+  retries: number
 }
 
 function positive(v: unknown, fallback: number): number {
   const n = typeof v === 'string' ? Number(v) : v
   return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : fallback
+}
+
+function count(v: unknown, fallback: number): number {
+  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v
+  return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.min(10, Math.floor(n)) : fallback
 }
 
 /** Reads the plugin's `userConfig` values, falling back to defaults on anything odd. */
@@ -395,7 +463,9 @@ export function readOptions(options: Readonly<Record<string, unknown>>): PluginS
     limits: {
       idleMs: positive(options.idleTimeoutSec, DEFAULT_IDLE_TIMEOUT_SEC) * 1000,
       wallMs: positive(options.maxRunMinutes, DEFAULT_MAX_RUN_MINUTES) * 60_000,
+      stallMs: positive(options.stallTimeoutSec, DEFAULT_STALL_TIMEOUT_SEC) * 1000,
     },
+    retries: count(options.stallRetries, DEFAULT_STALL_RETRIES),
   }
 }
 
@@ -445,19 +515,114 @@ export function decideBackground(
   return { background: false, reason: 'run_in_background not set' }
 }
 
-export type WatchdogKind = 'idle' | 'wall'
+/** `stall`: silent while waiting on the model; `idle`: silent while a tool runs; `wall`: too long in all. */
+export type WatchdogKind = 'idle' | 'wall' | 'stall'
 
-/** Which watchdog, if any, has expired for a run. */
+/**
+ * Which watchdog, if any, has expired for a run. Silence means something
+ * different by phase: while a pi tool runs (a long build, a slow test) it is
+ * normal, so only the idle limit applies; while pi waits on the model it means
+ * the provider has stalled, and the (shorter) stall limit applies.
+ */
 export function watchdogCheck(opts: {
   now: number
   startedAt: number
   lastEventAt: number
   limits: RunLimits
+  /** Whether a pi tool is running right now. */
+  isToolRunning?: boolean
+  /** The stall limit for this attempt; defaults to `limits.stallMs`. */
+  stallMs?: number
 }): WatchdogKind | undefined {
   const { now, startedAt, lastEventAt, limits } = opts
   if (now - startedAt >= limits.wallMs) return 'wall'
-  if (now - lastEventAt >= limits.idleMs) return 'idle'
-  return undefined
+  const silent = now - lastEventAt
+  if (opts.isToolRunning === true) return silent >= limits.idleMs ? 'idle' : undefined
+  return silent >= (opts.stallMs ?? limits.stallMs) ? 'stall' : undefined
+}
+
+/**
+ * The stall limit for an attempt (0 is the first): it doubles on each retry,
+ * so a model that legitimately thinks in silence for long still gets through
+ * while a provider that stalled is dropped quickly the first time.
+ */
+export function stallLimitFor(limits: RunLimits, attempt: number): number {
+  return limits.stallMs * 2 ** Math.max(0, attempt)
+}
+
+// Errors a fresh request may well not hit again: timeouts, dropped streams,
+// overloaded or failing upstreams (OpenRouter relays these from its providers).
+const TRANSIENT =
+  /timed? ?out|terminated|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|fetch failed|network error|stream (?:ended|closed|error)|premature close|overloaded|bad gateway|gateway time|upstream (?:error|connect)|provider returned error|\b(?:408|425|429|500|502|503|504|520|522|524|529)\b/i
+
+/** Whether a provider error from pi looks transient (worth a fresh attempt). */
+export function isTransientError(message: string): boolean {
+  return TRANSIENT.test(message)
+}
+
+/** Whether a failed attempt is worth resuming in a fresh pi session. */
+export function isRetryable(cause: FailureCause): boolean {
+  if (cause.kind === 'watchdog') return cause.watchdog === 'stall'
+  if (cause.kind === 'provider') return isTransientError(cause.message)
+  return false
+}
+
+/**
+ * How many retries a run gets: `retries`, raised so every fallback model gets
+ * one retry of its own; 0 turns retrying off.
+ */
+export function retryBudget(retries: number, fallbacks: readonly PiModel[]): number {
+  return retries === 0 ? 0 : Math.max(retries, 1 + fallbacks.length)
+}
+
+/**
+ * The model retry `n` (1 is the first retry) runs on. The first retry keeps
+ * the model: a fresh session gets a fresh route, and on OpenRouter usually
+ * another upstream provider. Later retries walk the fallback list, keeping
+ * the run's thinking level when the fallback names none.
+ */
+export function retryModel(
+  n: number,
+  model: PiModel | undefined,
+  fallbacks: readonly PiModel[],
+): PiModel | undefined {
+  const fallback = n >= 2 ? fallbacks[n - 2] : undefined
+  if (fallback === undefined) return model
+  return fallback.thinking === undefined && model?.thinking !== undefined
+    ? { ...fallback, thinking: model.thinking }
+    : fallback
+}
+
+/** What a resumed attempt is told, on top of the session it continues. */
+export const CONTINUE_PROMPT = [
+  'Your previous attempt at this task was cut off because the model provider stalled or failed (this is not something you did).',
+  'Continue the task from where it stopped, using what is already in this conversation. Do not redo work that is already done;',
+  'if a tool call has no result, check its effect before running it again.',
+  'When you are done, end with the final report as instructed.',
+].join(' ')
+
+/** One line on why an attempt ended, for the run's history. */
+export function attemptSummary(opts: {
+  n: number
+  model: string
+  cause: FailureCause
+  stallMs: number
+  elapsedMs: number
+}): string {
+  const { n, model, cause, stallMs, elapsedMs } = opts
+  const why =
+    cause.kind === 'watchdog' && cause.watchdog === 'stall'
+      ? `stalled (no events for ${formatDuration(stallMs)} while waiting on the model)`
+      : cause.kind === 'provider'
+        ? `provider error: ${oneLine(cause.message, 160)}`
+        : cause.kind
+  return `attempt ${n} on ${model}: ${why}, after ${formatDuration(elapsedMs)}`
+}
+
+/** The line a recovered run's report ends with. */
+export function recoveryNote(history: readonly string[], model: string): string | undefined {
+  if (history.length === 0) return undefined
+  return `[pi bridge: ${history.length === 1 ? 'one attempt' : `${history.length} attempts`} failed (${history.join('; ')}); the run was resumed in a fresh pi session and finished on ${model}.]`
 }
 
 const STDERR_NOISE = /^Warning: Extension package/
@@ -519,8 +684,16 @@ export function failureMessage(opts: {
   tally: RunTally
   stderr: string
   piPath?: string
+  /** The stall limit the last attempt ran under. */
+  stallMs?: number
+  /** Earlier attempts that failed and were retried, one line each. */
+  history?: readonly string[]
+  /** How to pick the run up by hand, when its pi session was kept. */
+  resumeHint?: string
 }): string {
   const { cause, agentType, model, elapsedMs, limits, tally } = opts
+  const tries = (opts.history?.length ?? 0) + 1
+  const after = tries > 1 ? ` on attempt ${tries} of ${tries}` : ''
   const ran = formatDuration(elapsedMs)
   const who = `${agentType} on ${model}`
   let head: string
@@ -531,17 +704,25 @@ export function failureMessage(opts: {
       hint = 'Ask the user before retrying; for long work use run_in_background, or pi through Bash in the background.'
       break
     case 'watchdog':
-      if (cause.watchdog === 'idle') {
-        head = `The pi watchdog stopped ${who}: pi sent no events for ${formatDuration(limits.idleMs)} (idle limit), after ${ran} in total.`
-        hint = 'The model or provider looks stalled. Retry, pick another model with /pi, or raise the plugin option idleTimeoutSec.'
+      if (cause.watchdog === 'stall') {
+        head = `The pi watchdog stopped ${who}${after}: the model sent nothing for ${formatDuration(opts.stallMs ?? limits.stallMs)} while pi waited on it (stall limit), after ${ran} in total.`
+        hint =
+          'The provider looks stalled. Retry later, add fallback models with /pi fallback add <provider/model>, or pick another model with /pi. ' +
+          'On OpenRouter, steer routing to faster upstream providers (openRouterRouting in pi’s models.json). ' +
+          'If this model just thinks silently for long, raise the plugin option stallTimeoutSec.'
+      } else if (cause.watchdog === 'idle') {
+        head = `The pi watchdog stopped ${who}: a pi tool ran for ${formatDuration(limits.idleMs)} with no output (idle limit), after ${ran} in total.`
+        hint = 'A command pi ran looks hung. Retry, ask for a shorter command, or raise the plugin option idleTimeoutSec.'
       } else {
         head = `The pi watchdog stopped ${who}: it hit the ${formatDuration(limits.wallMs)} wall-clock cap (ran ${ran}).`
         hint = 'Split the task into smaller runs, or raise the plugin option maxRunMinutes.'
       }
       break
     case 'provider':
-      head = `pi subagent ${who} failed with a provider/model error after ${ran}: ${cause.message}`
-      hint = 'Check the model id and provider sign-in (pi auth check), or pick another model with /pi.'
+      head = `pi subagent ${who} failed with a provider/model error${after} after ${ran}: ${cause.message}`
+      hint = isTransientError(cause.message)
+        ? 'The provider looks overloaded or flaky. Retry later, add fallback models with /pi fallback add <provider/model>, or pick another model with /pi.'
+        : 'Check the model id and provider sign-in (pi auth check), or pick another model with /pi.'
       break
     case 'exit':
       head = `pi subagent ${who} exited ${cause.signal !== null ? `on ${cause.signal}` : `with code ${String(cause.code)}`} after ${ran} without a final answer.`
@@ -561,8 +742,12 @@ export function failureMessage(opts: {
   lines.push(`Last tool step: ${step ?? '(none)'}`)
   const partial = tally.finalText.trim() !== '' ? tally.finalText : tally.tail
   if (partial.trim() !== '') lines.push(`Partial answer so far: ${oneLine(partial, 600)}`)
+  if (opts.history !== undefined && opts.history.length > 0) {
+    lines.push('Earlier attempts (each resumed in a fresh pi session):', ...opts.history.map(h => `  ${h}`))
+  }
   const err = stderrTail(opts.stderr)
   if (err.length > 0) lines.push('pi stderr (last 5 lines):', ...err.map(l => `  ${l}`))
+  if (opts.resumeHint !== undefined) lines.push(opts.resumeHint)
   lines.push(hint)
   return lines.join('\n')
 }

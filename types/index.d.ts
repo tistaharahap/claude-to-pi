@@ -20,6 +20,11 @@ export type PiSettings = {
   /** Claude's Agent `model` aliases mapped onto pi models. */
   tiers: Partial<Record<'haiku' | 'sonnet' | 'opus' | 'fable', PiModel>>
   profiles: PiProfile[]
+  /**
+   * Models a stalled or failing run moves to, in order, from its second retry
+   * on (the first retry keeps the model). Empty or unset: no fallback.
+   */
+  fallbacks?: PiModel[]
 }
 
 /** One tool call a pi run made, as the live row shows it. */
@@ -46,6 +51,8 @@ export type PiRun = {
   cost: number
   tail: string
   error?: string
+  /** Set while the run recovers from a stall, e.g. "stalled · retry 1/2". */
+  notice?: string
 }
 
 /** A row of `pi --list-models`. */

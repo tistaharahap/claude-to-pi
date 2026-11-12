@@ -39,7 +39,7 @@ If `/pi status` already maps what the user asked for, dispatch straight away. Ea
 
 - Make the prompt self-contained. pi sees none of this conversation, only your prompt and the repo, including its `AGENTS.md`/`CLAUDE.md`.
 - `run_in_background: true` returns at once. Progress goes to the `outputFile` in the result, and the final report arrives later as a task notification. Don't poll the file.
-- A foreground pi call blocks your turn until pi finishes. The plugin kills a run that sends nothing for 3 minutes or runs past 30 minutes, and the error names the model, the elapsed time, the last tool step and pi's stderr. Read that error before retrying.
+- A foreground pi call blocks your turn until pi finishes. When the provider stalls (common on OpenRouter: nothing from the model for 90 s) or fails with a timeout or 5xx, the plugin resumes the run in a fresh pi session on its own, keeping the work done so far, and moves to any `/pi fallback` models on later retries. A report that ends with a `[pi bridge: … attempt failed …]` note recovered this way, and the note names the model it finished on. A run that keeps stalling, has a tool silent for 3 minutes, or runs past 30 minutes fails, and the error names the model, the elapsed time, the attempts, the last tool step and pi's stderr. Read that error before retrying.
 
 ## When your Agent tool has no `run_in_background`
 
@@ -71,7 +71,7 @@ When the Bash task finishes, read the final answer from the `agent_end` event:
 jq -r 'select(.type=="agent_end") | [.messages[] | select(.role=="assistant")] | last | .content[] | select(.type=="text") | .text' "$out.jsonl"
 ```
 
-If that prints nothing, check for a provider error: `jq -r 'select(.type=="message_end" and .message.role=="assistant") | .message | select(.stopReason=="error") | .errorMessage' "$out.jsonl"`, then `tail -5 "$out.err"`.
+A manual Bash run gets none of the plugin's stall recovery or watchdogs, so give the Bash call a timeout. If that prints nothing, check for a provider error: `jq -r 'select(.type=="message_end" and .message.role=="assistant") | .message | select(.stopReason=="error") | .errorMessage' "$out.jsonl"`, then `tail -5 "$out.err"`.
 - To compare models, send one call per profile in a single message with identical prompts. For proposals, keep runs propose-only ("return a diff, edit nothing") or use `--read-only` profiles, because parallel `pi:agent` runs share one checkout.
 
 ## Common mistakes
@@ -84,5 +84,5 @@ If that prints nothing, check for a provider error: `jq -r 'select(.type=="messa
 | Assuming a background `pi:agent` will wait for approvals | pi never asks. It edits files and runs commands without Claude Code's permission prompts. Say so before dispatching `pi:agent` for edits, and prefer `pi:explore` when nothing should change. |
 | Treating a failed run (unknown model, provider 4xx) as Claude's fault | The error names the pi model. Ask the user to fix it with `/pi`. |
 | Retrying straight after "interrupted by the user (Esc)" | The user stopped it. Ask before running it again, and offer a background run. |
-| Retrying a watchdog kill unchanged | The model stalled or the task was too big. Split the task, or ask the user to pick another model. |
+| Retrying a watchdog kill unchanged | The bridge already resumed stalled runs (and tried any `/pi fallback` models) before it gave up. Split the task, or ask the user to pick another model or add fallbacks with `/pi fallback add <provider/model>`. |
 | Firing several long foreground pi calls at once when your Agent tool lacks `run_in_background` | Let `background: "auto"` launch them in the background, or use background Bash runs as above. |

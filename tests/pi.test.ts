@@ -4,13 +4,19 @@ import {
   EMPTY_SETTINGS,
   agentRecord,
   applyEvent,
+  beginAttempt,
   buildArgv,
   classifyEnd,
   decideBackground,
   failureMessage,
   filterModels,
   hostExposesBackground,
+  isRetryable,
+  isTransientError,
   lastStep,
+  retryBudget,
+  retryModel,
+  stallLimitFor,
   readOptions,
   resolveHostExposes,
   shouldDrawLiveRow,
@@ -120,17 +126,35 @@ test('an errored assistant message is the run error', async () => {
   expect(tally.error).toBe('401 Unauthorized')
 })
 
-test('plugin options default to auto background, 180 s idle and a 30 min cap', async () => {
+test('plugin options default to auto background, 90 s stall, 180 s idle, 2 retries and a 30 min cap', async () => {
   expect(readOptions({})).toEqual({
     piPath: 'pi',
     isolate: true,
     background: 'auto',
-    limits: { idleMs: 180_000, wallMs: 1_800_000 },
+    limits: { idleMs: 180_000, wallMs: 1_800_000, stallMs: 90_000 },
+    retries: 2,
   })
-  const o = readOptions({ piPath: '/bin/pi', isolate: false, background: 'Never', idleTimeoutSec: 30, maxRunMinutes: '5' })
-  expect(o).toEqual({ piPath: '/bin/pi', isolate: false, background: 'never', limits: { idleMs: 30_000, wallMs: 300_000 } })
+  const o = readOptions({
+    piPath: '/bin/pi',
+    isolate: false,
+    background: 'Never',
+    idleTimeoutSec: 30,
+    maxRunMinutes: '5',
+    stallTimeoutSec: '45',
+    stallRetries: 0,
+  })
+  expect(o).toEqual({
+    piPath: '/bin/pi',
+    isolate: false,
+    background: 'never',
+    limits: { idleMs: 30_000, wallMs: 300_000, stallMs: 45_000 },
+    retries: 0,
+  })
   expect(readOptions({ background: 'sometimes', idleTimeoutSec: -1, maxRunMinutes: 'x' }).background).toBe('auto')
   expect(readOptions({ idleTimeoutSec: 0 }).limits.idleMs).toBe(180_000)
+  expect(readOptions({ stallRetries: -1 }).retries).toBe(2)
+  expect(readOptions({ stallRetries: 2.7 }).retries).toBe(2)
+  expect(readOptions({ stallRetries: 99 }).retries).toBe(10)
 })
 
 test('auto backgrounds a run when the host Agent tool cannot ask for it', async () => {
@@ -151,12 +175,97 @@ test('auto backgrounds a run when the host Agent tool cannot ask for it', async 
   expect(decideBackground('auto', undefined, false).reason).toContain('no run_in_background')
 })
 
-test('watchdogs: the wall-clock cap, then the idle limit', async () => {
-  const limits = { idleMs: 180_000, wallMs: 1_800_000 }
-  expect(watchdogCheck({ now: 179_999, startedAt: 0, lastEventAt: 0, limits })).toBeUndefined()
-  expect(watchdogCheck({ now: 180_000, startedAt: 0, lastEventAt: 0, limits })).toBe('idle')
-  expect(watchdogCheck({ now: 1_000_000, startedAt: 0, lastEventAt: 900_000, limits })).toBeUndefined()
+test('watchdogs: the wall-clock cap, the stall limit on the model, the idle limit on tools', async () => {
+  const limits = { idleMs: 180_000, wallMs: 1_800_000, stallMs: 90_000 }
+  // Waiting on the model: silence past the stall limit is a stall.
+  expect(watchdogCheck({ now: 89_999, startedAt: 0, lastEventAt: 0, limits })).toBeUndefined()
+  expect(watchdogCheck({ now: 90_000, startedAt: 0, lastEventAt: 0, limits })).toBe('stall')
+  expect(watchdogCheck({ now: 150_000, startedAt: 0, lastEventAt: 0, limits, stallMs: 180_000 })).toBeUndefined()
+  // A tool running: the same silence is normal until the idle limit.
+  expect(watchdogCheck({ now: 179_999, startedAt: 0, lastEventAt: 0, limits, isToolRunning: true })).toBeUndefined()
+  expect(watchdogCheck({ now: 180_000, startedAt: 0, lastEventAt: 0, limits, isToolRunning: true })).toBe('idle')
+  expect(watchdogCheck({ now: 1_000_000, startedAt: 0, lastEventAt: 950_000, limits })).toBeUndefined()
   expect(watchdogCheck({ now: 1_800_000, startedAt: 0, lastEventAt: 1_799_000, limits })).toBe('wall')
+  expect([0, 1, 2].map(n => stallLimitFor(limits, n))).toEqual([90_000, 180_000, 360_000])
+})
+
+test('the tally knows whether a tool runs, and the session it writes', async () => {
+  const tally = newTally()
+  applyEvent(tally, { type: 'session', version: 3, id: 'sess-1' })
+  expect(tally.sessionId).toBe('sess-1')
+  expect(tally.sawMessage).toBe(false)
+  applyEvent(tally, { type: 'message_end', message: { role: 'user', content: 'go' } })
+  expect(tally.sawMessage).toBe(true)
+  applyEvent(tally, { type: 'tool_execution_start', toolCallId: 'a', toolName: 'bash', args: { command: 'make' } })
+  expect(tally.openTools).toEqual(['a'])
+  applyEvent(tally, { type: 'tool_execution_start', toolCallId: 'b', toolName: 'read', args: { path: 'x' } })
+  applyEvent(tally, { type: 'tool_execution_end', toolCallId: 'a', isError: false })
+  expect(tally.openTools).toEqual(['b'])
+
+  // A new attempt keeps counts but not the answer, session or open tools;
+  // the step the killed attempt left running reads as failed.
+  tally.finalText = 'half'
+  beginAttempt(tally)
+  expect(tally.openTools).toEqual([])
+  expect(tally.sessionId).toBeUndefined()
+  expect(tally.sawMessage).toBe(false)
+  expect(tally.finalText).toBe('')
+  expect(tally.toolCount).toBe(2)
+  expect(tally.steps[1]).toEqual({ tool: 'read', summary: 'x', isDone: true, isError: true })
+})
+
+test('stalls and transient provider errors are retried; the rest is not', async () => {
+  expect(isRetryable({ kind: 'watchdog', watchdog: 'stall' })).toBe(true)
+  expect(isRetryable({ kind: 'watchdog', watchdog: 'idle' })).toBe(false)
+  expect(isRetryable({ kind: 'watchdog', watchdog: 'wall' })).toBe(false)
+  expect(isRetryable({ kind: 'user' })).toBe(false)
+  expect(isRetryable({ kind: 'spawn', message: 'ENOENT' })).toBe(false)
+  expect(isRetryable({ kind: 'exit', code: 1, signal: null })).toBe(false)
+  for (const m of [
+    'Request timed out',
+    '504 Gateway Timeout',
+    'terminated',
+    'fetch failed',
+    'socket hang up',
+    '502 Provider returned error',
+    '429 Rate limit exceeded upstream',
+    'stream ended before completion',
+  ]) {
+    expect(isTransientError(m)).toBe(true)
+  }
+  for (const m of [
+    '401 Unauthorized',
+    'Model "nosuch/model" not found',
+    'No endpoints found matching your data policy',
+    '400 Invalid request: context length exceeded',
+  ]) {
+    expect(isTransientError(m)).toBe(false)
+  }
+})
+
+test('retries keep the model first, then walk the fallbacks', async () => {
+  const main = { provider: 'openrouter', model: 'qwen/qwen3-coder', thinking: 'high' }
+  const fb1 = { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' }
+  const fb2 = { provider: 'openai', model: 'gpt-5.4-mini', thinking: 'low' }
+  expect(retryModel(1, main, [fb1, fb2])).toBe(main)
+  expect(retryModel(2, main, [fb1, fb2])).toEqual({ ...fb1, thinking: 'high' })
+  expect(retryModel(3, main, [fb1, fb2])).toEqual(fb2)
+  expect(retryModel(4, main, [fb1, fb2])).toBe(main)
+  expect(retryModel(2, undefined, [])).toBeUndefined()
+  expect(retryBudget(2, [])).toBe(2)
+  expect(retryBudget(2, [fb1, fb2])).toBe(3)
+  expect(retryBudget(0, [fb1, fb2])).toBe(0)
+})
+
+test('argv keeps a session to resume: a named one first, then a fork', async () => {
+  const plan = { agentType: 'pi:agent', readOnly: false }
+  const first = buildArgv({ piPath: 'pi', plan, prompt: 'p', isolate: true, session: { dir: '/t/s', id: 'abc' } })
+  expect(first).not.toContain('--no-session')
+  expect(first[first.indexOf('--session-dir') + 1]).toBe('/t/s')
+  expect(first[first.indexOf('--session-id') + 1]).toBe('abc')
+  const retry = buildArgv({ piPath: 'pi', plan, prompt: 'p', isolate: true, session: { dir: '/t/s', fork: 'abc' } })
+  expect(retry[retry.indexOf('--fork') + 1]).toBe('abc')
+  expect(retry).not.toContain('--session-id')
 })
 
 test('a run end is told apart: watchdog, Esc, spawn, provider, bad exit', async () => {
@@ -182,7 +291,7 @@ test('a failure message names the model, the time, the last step and stderr', as
   expect(lastStep(tally)).toBe('grep TODO (still running)')
   const stderr = ['Warning: Extension package "x": noise', 'l1', 'l2', 'l3', 'l4', 'l5', 'l6', ''].join('\n')
   expect(stderrTail(stderr)).toEqual(['l2', 'l3', 'l4', 'l5', 'l6'])
-  const limits = { idleMs: 180_000, wallMs: 1_800_000 }
+  const limits = { idleMs: 180_000, wallMs: 1_800_000, stallMs: 90_000 }
   const base = { agentType: 'pi:explore', model: 'openrouter/deepseek/x', elapsedMs: 200_000, limits, tally, stderr }
 
   const idle = failureMessage({ ...base, cause: { kind: 'watchdog', watchdog: 'idle' } })
@@ -206,6 +315,22 @@ test('a failure message names the model, the time, the last step and stderr', as
   const provider = failureMessage({ ...base, cause: { kind: 'provider', message: '401 Unauthorized' } })
   expect(provider).toContain('provider/model error')
   expect(provider).toContain('401 Unauthorized')
+  expect(provider).toContain('pi auth check')
+
+  const stall = failureMessage({
+    ...base,
+    cause: { kind: 'watchdog', watchdog: 'stall' },
+    stallMs: 360_000,
+    history: ['attempt 1 on a: stalled', 'attempt 2 on a: stalled'],
+    resumeHint: 'pi --fork s3',
+  })
+  expect(stall).toContain('on attempt 3 of 3')
+  expect(stall).toContain('sent nothing for 6m 0s')
+  expect(stall).toContain('  attempt 2 on a: stalled')
+  expect(stall).toContain('/pi fallback add')
+  expect(stall).toContain('openRouterRouting')
+  expect(stall).toContain('stallTimeoutSec')
+  expect(stall).toContain('pi --fork s3')
 })
 
 test('a cut-off tool.list summary never proves run_in_background is missing', async () => {

@@ -7,8 +7,11 @@ import {
   EMPTY_SETTINGS,
   THINKING_LEVELS,
   TIER_ALIASES,
+  CONTINUE_PROMPT,
   agentRecord,
   applyEvent,
+  attemptSummary,
+  beginAttempt,
   buildArgv,
   classifyEnd,
   decideBackground,
@@ -19,6 +22,7 @@ import {
   formatModel,
   formatTokens,
   hostExposesBackground,
+  isRetryable,
   isValidProfileName,
   newTally,
   parseLine,
@@ -27,8 +31,12 @@ import {
   planRun,
   profileDescription,
   readOptions,
+  recoveryNote,
   resolveHostExposes,
+  retryBudget,
+  retryModel,
   shouldDrawLiveRow,
+  stallLimitFor,
   type FailureCause,
   type RunLimits,
   type RunPlan,
@@ -49,9 +57,9 @@ const REDRAW_MS = 1000
 // Bump a shape tag whenever that value's fields change: it declines what an
 // earlier version stored, which outlives a hot reload.
 const settingsAtom = atom({ plugin: 'pi', key: 'settings' } as const, EMPTY_SETTINGS, {
-  shape: 'settings-1',
+  shape: 'settings-2',
 })
-const runsAtom = atom({ plugin: 'pi', key: 'runs' } as const, {}, { shape: 'runs-2' })
+const runsAtom = atom({ plugin: 'pi', key: 'runs' } as const, {}, { shape: 'runs-3' })
 // What the host's Agent tool offers, read off its full description.
 const hostAtom = atom({ plugin: 'pi', key: 'host' } as const, {}, { shape: 'host-1' })
 const pickerAtom = atom(
@@ -74,6 +82,7 @@ function normalizeSettings(raw: unknown): PiSettings {
     ...(s.defaultModel !== undefined ? { defaultModel: s.defaultModel } : {}),
     tiers: s.tiers ?? {},
     profiles: Array.isArray(s.profiles) ? s.profiles : [],
+    ...(Array.isArray(s.fallbacks) && s.fallbacks.length > 0 ? { fallbacks: s.fallbacks } : {}),
   }
 }
 
@@ -171,11 +180,17 @@ type PiJob = {
   piPath: string
   isolate: boolean
   limits: RunLimits
+  /** Retries after a stall or a transient provider error (0: none). */
+  retries: number
+  /** Models later retries move to (see retryModel). */
+  fallbacks: readonly PiModel[]
   plan: RunPlan
   prompt: string
   description: string
   runKey: string
   agentId: string
+  /** Where this run's pi sessions live, so a stalled attempt can be resumed. */
+  sessionDir: string
 }
 
 type PiOutcome = {
@@ -184,24 +199,37 @@ type PiOutcome = {
   cause?: FailureCause
   /** What the model or the notification reads when `cause` is set. */
   error?: string
+  /** Attempts that failed and were retried, one line each. */
+  history: string[]
   durationMs: number
 }
 
 type Pull = IteratorResult<{ stream: 'stdout' | 'stderr'; text: string }, { code: number | null; signal: string | null }>
 
+type AttemptEnd = {
+  exit?: { code: number | null; signal: string | null }
+  spawnError?: string
+  watchdog?: WatchdogKind
+}
+
 /**
- * Runs `pi --print --mode json` for a job, folding its event stream into a
- * tally and the live row's state; `onProgress` sees the tally as it grows.
+ * Runs a pi subagent job, folding pi's event stream into a tally and the live
+ * row's state; `onProgress` sees the tally (and failed attempts) as it grows.
  *
  * Every REDRAW_MS the row is redrawn (so elapsed time ticks while pi is
- * silent) and the watchdogs are checked: no pi JSON event for `idleMs`, or
- * `wallMs` in all, kills pi and ends the run with a named error.
+ * silent) and the watchdogs are checked. When the provider stalls (no event
+ * while pi waits on the model) or fails with a transient error, pi is killed
+ * and the run resumes by forking the pi session the attempt left: the work
+ * so far is kept, and the new session id gets a fresh route (on OpenRouter,
+ * usually another upstream provider). Each retry doubles the stall limit;
+ * later retries move to the fallback models. A hung tool, the wall clock,
+ * Esc and other errors end the run with a named error.
  */
 async function runPi(
   $: $,
   job: PiJob,
   signal: AbortSignal | undefined,
-  onProgress?: (tally: RunTally) => Promise<void>,
+  onProgress?: (tally: RunTally, history: readonly string[]) => Promise<void>,
 ): Promise<PiOutcome> {
   const startedAt = await $.clock.now()
   const base: PiRun = {
@@ -219,106 +247,188 @@ async function runPi(
   await update($, runsAtom, runs => ({ ...pruneRuns(runs), [job.runKey]: base }))
 
   const tally = newTally()
+  const history: string[] = []
   let stderr = ''
-  let exit: { code: number | null; signal: string | null } | undefined
-  let spawnError: string | undefined
-  let watchdog: WatchdogKind | undefined
   let lastDraw = Number.NEGATIVE_INFINITY
-  let lastEventAt = startedAt
   let hasOutput = false
-  const argv = buildArgv({ piPath: job.piPath, plan: job.plan, prompt: job.prompt, isolate: job.isolate })
+  let notice: string | undefined
 
   const draw = async (now: number): Promise<void> => {
     lastDraw = now
     await update($, runsAtom, runs => ({
       ...runs,
-      [job.runKey]: { ...viewOf(base, tally), status: hasOutput ? ('running' as const) : ('starting' as const), updatedAt: now },
+      [job.runKey]: {
+        ...viewOf(base, tally),
+        status: hasOutput ? ('running' as const) : ('starting' as const),
+        updatedAt: now,
+        ...(notice !== undefined ? { notice } : {}),
+      },
     }))
-    if (onProgress !== undefined) await onProgress(tally)
+    if (onProgress !== undefined) await onProgress(tally, history)
   }
 
-  const child = $.process.spawn({ argv, env: { PI_SUBAGENT: '1' } })
-  const iter = child[Symbol.asyncIterator]()
-  let tick: Promise<'tick'> | undefined
-  try {
-    let buffer = ''
-    let pull: Promise<Pull> = iter.next() as Promise<Pull>
-    for (;;) {
-      tick ??= $.clock.sleep(REDRAW_MS, signal !== undefined ? { signal } : undefined).then(() => 'tick' as const)
-      const got = await Promise.race([pull, tick])
-      if (got === 'tick') {
-        tick = undefined
-        const now = await $.clock.now()
-        watchdog = watchdogCheck({ now, startedAt, lastEventAt, limits: job.limits })
-        if (watchdog !== undefined) {
-          // Ending the stream kills pi. Don't wait on it: a hung child may
-          // never answer the pull still pending.
-          pull.catch(() => {})
-          void Promise.resolve(iter.return?.({ code: null, signal: 'SIGTERM' })).catch(() => {})
+  /** One pi process: runs until it exits, the signal aborts, or a watchdog fires. */
+  const attempt = async (argv: string[], stallMs: number): Promise<AttemptEnd> => {
+    const end: AttemptEnd = {}
+    let lastEventAt = await $.clock.now()
+    const child = $.process.spawn({ argv, env: { PI_SUBAGENT: '1' } })
+    const iter = child[Symbol.asyncIterator]()
+    let tick: Promise<'tick'> | undefined
+    try {
+      let buffer = ''
+      let pull: Promise<Pull> = iter.next() as Promise<Pull>
+      for (;;) {
+        tick ??= $.clock.sleep(REDRAW_MS, signal !== undefined ? { signal } : undefined).then(() => 'tick' as const)
+        const got = await Promise.race([pull, tick])
+        if (got === 'tick') {
+          tick = undefined
+          const now = await $.clock.now()
+          end.watchdog = watchdogCheck({
+            now,
+            startedAt,
+            lastEventAt,
+            limits: job.limits,
+            isToolRunning: tally.openTools.length > 0,
+            stallMs,
+          })
+          if (end.watchdog !== undefined) {
+            // Ending the stream kills pi. Don't wait on it: a hung child may
+            // never answer the pull still pending.
+            pull.catch(() => {})
+            void Promise.resolve(iter.return?.({ code: null, signal: 'SIGTERM' })).catch(() => {})
+            break
+          }
+          await draw(now)
+          continue
+        }
+        if (got.done === true) {
+          end.exit = got.value
           break
         }
-        await draw(now)
-        continue
-      }
-      if (got.done === true) {
-        exit = got.value
-        break
-      }
-      const chunk = got.value
-      if (chunk.stream === 'stderr') {
-        stderr = (stderr + chunk.text).slice(-4000)
-        pull = iter.next() as Promise<Pull>
-        continue
-      }
-      hasOutput = true
-      const { lines, rest } = takeLines(buffer + chunk.text)
-      buffer = rest
-      let sawEvent = false
-      for (const line of lines) {
-        const ev = parseLine(line)
-        if (ev !== undefined) {
-          applyEvent(tally, ev)
-          sawEvent = true
+        const chunk = got.value
+        if (chunk.stream === 'stderr') {
+          stderr = (stderr + chunk.text).slice(-4000)
+          pull = iter.next() as Promise<Pull>
+          continue
         }
+        hasOutput = true
+        const { lines, rest } = takeLines(buffer + chunk.text)
+        buffer = rest
+        let sawEvent = false
+        for (const line of lines) {
+          const ev = parseLine(line)
+          if (ev !== undefined) {
+            applyEvent(tally, ev)
+            sawEvent = true
+          }
+        }
+        const now = await $.clock.now()
+        if (sawEvent) lastEventAt = now
+        if (now - lastDraw >= REDRAW_MS) await draw(now)
+        // Ask for more only once this piece is drawn.
+        pull = iter.next() as Promise<Pull>
       }
-      const now = await $.clock.now()
-      if (sawEvent) lastEventAt = now
-      if (now - lastDraw >= REDRAW_MS) await draw(now)
-      // Ask for more only once this piece is drawn.
-      pull = iter.next() as Promise<Pull>
+      const ev = parseLine(buffer)
+      if (ev !== undefined) applyEvent(tally, ev)
+    } catch (err) {
+      if (signal?.aborted !== true) end.spawnError = String(err)
+    } finally {
+      // The beat still pending rejects if the signal aborts later: nobody waits on it.
+      tick?.catch(() => {})
     }
-    const ev = parseLine(buffer)
-    if (ev !== undefined) applyEvent(tally, ev)
-  } catch (err) {
-    if (signal?.aborted !== true) spawnError = String(err)
-  } finally {
-    // The beat still pending rejects if the signal aborts later: nobody waits on it.
-    tick?.catch(() => {})
+    return end
+  }
+
+  const budget = retryBudget(job.retries, job.fallbacks)
+  let model = job.plan.model
+  // The session the next attempt forks: the last one that holds messages.
+  let resumeFrom: string | undefined
+  let cause: FailureCause | undefined
+  let stallMs = stallLimitFor(job.limits, 0)
+  for (let n = 0; ; n++) {
+    stallMs = stallLimitFor(job.limits, n)
+    const attemptStart = await $.clock.now()
+    const isResume = resumeFrom !== undefined
+    const argv = buildArgv({
+      piPath: job.piPath,
+      plan: { ...job.plan, ...(model !== undefined ? { model } : {}) },
+      prompt: isResume ? CONTINUE_PROMPT : job.prompt,
+      isolate: job.isolate,
+      session: isResume ? { dir: job.sessionDir, fork: resumeFrom } : { dir: job.sessionDir, id: crypto.randomUUID() },
+    })
+    beginAttempt(tally)
+    const end = await attempt(argv, stallMs)
+    const attemptCause = classifyEnd({ ...end, aborted: signal?.aborted === true, tally })
+    // A provider hiccup pi recovered from still leaves an answer worth keeping.
+    const failed = attemptCause !== undefined && !(attemptCause.kind === 'provider' && tally.finalText.trim() !== '')
+    if (!failed) {
+      cause = undefined
+      break
+    }
+    cause = attemptCause
+    if (tally.sessionId !== undefined && (isResume || tally.sawMessage)) resumeFrom = tally.sessionId
+    const now = await $.clock.now()
+    if (!isRetryable(attemptCause) || n >= budget || now - startedAt >= job.limits.wallMs) break
+    const ranOn = tally.models[tally.models.length - 1] ?? formatModel(model)
+    history.push(attemptSummary({ n: n + 1, model: ranOn, cause: attemptCause, stallMs, elapsedMs: now - attemptStart }))
+    model = retryModel(n + 1, job.plan.model, job.fallbacks)
+    base.model = formatModel(model)
+    notice = `${attemptCause.kind === 'watchdog' ? 'provider stalled' : 'provider error'} · retry ${n + 1}/${budget}${
+      model !== job.plan.model ? ` on ${formatModel(model)}` : ''
+    }`
+    await draw(now)
   }
 
   const endedAt = await $.clock.now()
   const durationMs = endedAt - startedAt
-  const cause = classifyEnd({ watchdog, aborted: signal?.aborted === true, spawnError, tally, exit })
-  // A provider hiccup pi recovered from still leaves an answer worth keeping.
-  const failed = cause !== undefined && !(cause.kind === 'provider' && tally.finalText.trim() !== '')
-  const error = failed
-    ? failureMessage({
-        cause,
-        agentType: job.plan.agentType,
-        model: tally.models[tally.models.length - 1] ?? formatModel(job.plan.model),
-        elapsedMs: durationMs,
-        limits: job.limits,
-        tally,
-        stderr,
-        piPath: job.piPath,
-      })
-    : undefined
-  const status: PiRun['status'] = cause?.kind === 'user' ? 'interrupted' : failed ? 'failed' : 'completed'
+  const lastModel = tally.models[tally.models.length - 1] ?? formatModel(model)
+  const error =
+    cause !== undefined
+      ? failureMessage({
+          cause,
+          agentType: job.plan.agentType,
+          model: lastModel,
+          elapsedMs: durationMs,
+          limits: job.limits,
+          tally,
+          stderr,
+          piPath: job.piPath,
+          stallMs,
+          history,
+          ...(resumeFrom !== undefined && cause.kind !== 'user'
+            ? {
+                resumeHint: `pi's session is kept: inspect or continue it with \`${job.piPath} --session-dir ${job.sessionDir} --fork ${resumeFrom}\`.`,
+              }
+            : {}),
+        })
+      : undefined
+  const status: PiRun['status'] = cause?.kind === 'user' ? 'interrupted' : cause !== undefined ? 'failed' : 'completed'
   await update($, runsAtom, runs => ({
     ...runs,
     [job.runKey]: { ...viewOf(base, tally), status, endedAt, ...(error !== undefined ? { error } : {}) },
   }))
-  return { tally, durationMs, ...(failed ? { cause, error } : {}) }
+  // A finished run's sessions are of no further use; a failed run's are kept
+  // so the person can pick the work up (the error says how).
+  if (cause === undefined || cause.kind === 'user') await removeDir($, job.sessionDir)
+  return { tally, durationMs, history, ...(cause !== undefined ? { cause, error } : {}) }
+}
+
+/** Removes a run's own session folder; best effort (the OS cleans temp anyway). */
+async function removeDir($: $, dir: string): Promise<void> {
+  if (!/\/claude-pi\/sessions\/pi-[\w-]+$/.test(dir)) return
+  try {
+    await $.process.run(['rm', '-rf', dir], { timeoutMs: 10_000 })
+  } catch {
+    // Not fatal: the folder sits in the temp directory.
+  }
+}
+
+async function tempDir($: $): Promise<string> {
+  try {
+    return ((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '') || '/tmp'
+  } catch {
+    return '/tmp'
+  }
 }
 
 /** Whether this session's Agent tool can ask for run_in_background at all. */
@@ -340,7 +450,7 @@ function pruneRuns(runs: Record<string, PiRun>): Record<string, PiRun> {
   return Object.fromEntries(entries.filter(([, r]) => r.endedAt === undefined).concat(entries.slice(-20)))
 }
 
-function progressReport(job: PiJob, tally: RunTally, footer: string): string {
+function progressReport(job: PiJob, tally: RunTally, history: readonly string[], footer: string): string {
   const steps = tally.steps.map(s => `- ${s.isError ? '✗' : s.isDone ? '✓' : '…'} ${s.tool} ${s.summary}`)
   return [
     `# ${job.plan.agentType}: ${job.description}`,
@@ -350,6 +460,9 @@ function progressReport(job: PiJob, tally: RunTally, footer: string): string {
     '## Tool calls',
     steps.length === 0 ? '(none yet)' : steps.join('\n'),
     '',
+    ...(history.length > 0
+      ? ['## Retries', ...history.map(h => `- ${h}; resumed in a fresh pi session`), '']
+      : []),
     footer,
   ].join('\n')
 }
@@ -358,28 +471,30 @@ function progressReport(job: PiJob, tally: RunTally, footer: string): string {
  * comes back to the session as a message, the way a background task's does. */
 async function runInBackground($: $, job: PiJob, outputFile: string): Promise<void> {
   let lastWrite = 0
-  const out = await runPi($, job, undefined, async tally => {
+  const out = await runPi($, job, undefined, async (tally, history) => {
     const now = Date.now()
     if (now - lastWrite < 2000) return
     lastWrite = now
-    await $.fs.write(outputFile, progressReport(job, tally, '## Status\nRunning…'))
+    await $.fs.write(outputFile, progressReport(job, tally, history, '## Status\nRunning…'))
   })
   const ok = out.error === undefined
+  const ranOn = out.tally.models[out.tally.models.length - 1] ?? formatModel(job.plan.model)
+  const note = recoveryNote(out.history, ranOn)
   const final = ok
-    ? `## Final report\n\n${out.tally.finalText}`
+    ? `## Final report\n\n${out.tally.finalText}${note !== undefined ? `\n\n${note}` : ''}`
     : `## Failed\n\n${out.error ?? 'unknown error'}`
-  await $.fs.write(outputFile, progressReport(job, out.tally, final))
+  await $.fs.write(outputFile, progressReport(job, out.tally, out.history, final))
   const meta = `${out.tally.toolCount} tool uses, ${formatTokens(out.tally.input + out.tally.output + out.tally.cacheRead + out.tally.cacheWrite)} tokens, ${formatDuration(out.durationMs)}`
   $.ui.toast(`${job.plan.agentType} ${ok ? 'finished' : 'failed'}: ${job.description}`)
   await $.prompt.submit({
     text: ok
-      ? `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") completed on ${out.tally.models[out.tally.models.length - 1] ?? formatModel(job.plan.model)} (${meta}). Output file: ${outputFile}\n\nFinal report:\n${out.tally.finalText}\n</task-notification>`
+      ? `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") completed on ${ranOn} (${meta}). Output file: ${outputFile}\n\nFinal report:\n${out.tally.finalText}${note !== undefined ? `\n\n${note}` : ''}\n</task-notification>`
       : `<task-notification>\nBackground pi subagent ${job.agentId} (${job.plan.agentType}: "${job.description}") failed. Output file: ${outputFile}\n\n${out.error ?? 'unknown error'}\n</task-notification>`,
   })
 }
 
 export const register: Register = (on, options) => {
-  const { piPath, isolate, background, limits } = readOptions(options)
+  const { piPath, isolate, background, limits, retries } = readOptions(options)
 
   // ------------------------------------------------------------- lifecycle
 
@@ -391,7 +506,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pi',
       description: 'Choose the pi provider/model for pi subagents, map tiers, manage pi agent profiles',
-      argumentHint: '[status | model <provider/model[:thinking]> | tier <haiku|sonnet|opus|fable> <ref> | profile add|rm|list | models [search]]',
+      argumentHint: '[status | model <provider/model[:thinking]> | tier <haiku|sonnet|opus|fable> <ref> | profile add|rm|list | fallback add|rm|clear|list | models [search]]',
       immediate: true,
     })
     await registerAgents($, s)
@@ -414,15 +529,20 @@ export const register: Register = (on, options) => {
       return { deny: `pi subagents do not support isolation "${e.isolation}"; call again without it.` }
     }
 
+    const agentId = `pi-${crypto.randomUUID().slice(0, 12)}`
+    const tmp = await tempDir($)
     const job: PiJob = {
       piPath,
       isolate,
       limits,
+      retries,
+      fallbacks: settings.fallbacks ?? [],
       plan,
       prompt: e.prompt,
       description: e.description,
       runKey: e.tool_use_id,
-      agentId: `pi-${crypto.randomUUID().slice(0, 12)}`,
+      agentId,
+      sessionDir: `${tmp}/claude-pi/sessions/${agentId}`,
     }
 
     const flag = (e as { run_in_background?: unknown }).run_in_background
@@ -432,7 +552,7 @@ export const register: Register = (on, options) => {
       background === 'auto' && flag === undefined ? await agentExposesBackground($) : undefined,
     )
     if (mode.background) {
-      const dir = `${((await $.env.get('TMPDIR')) ?? '/tmp').replace(/\/$/, '')}/claude-pi`
+      const dir = `${tmp}/claude-pi`
       const outputFile = `${dir}/${job.agentId}.md`
       await $.fs.write(outputFile, `# ${plan.agentType}: ${e.description}\n\nStarting pi (${formatModel(plan.model)}) in the background: ${mode.reason}.\n`)
       void runInBackground($, job, outputFile).catch(err => {
@@ -455,6 +575,7 @@ export const register: Register = (on, options) => {
 
     const out = await runPi($, job, next.signal)
     if (out.error !== undefined) return { deny: out.error }
+    const note = recoveryNote(out.history, out.tally.models[out.tally.models.length - 1] ?? formatModel(plan.model))
     return {
       result: agentRecord({
         agentId: job.agentId,
@@ -462,6 +583,7 @@ export const register: Register = (on, options) => {
         prompt: e.prompt,
         tally: out.tally,
         durationMs: out.durationMs,
+        ...(note !== undefined ? { note } : {}),
       }),
     }
   }).catch(($, e, next) =>
@@ -512,6 +634,7 @@ export const register: Register = (on, options) => {
           </Text>
         ))}
         {run.tail !== '' && <Text dimColor>{`     ${run.tail}`}</Text>}
+        {run.notice !== undefined && <Text color="yellow">{`     ⟳ ${run.notice}`}</Text>}
         <Text dimColor>{`     ${run.status === 'starting' ? 'Starting pi… · ' : ''}${meta}`}</Text>
       </Box>
     )
@@ -604,6 +727,49 @@ export const register: Register = (on, options) => {
         return { text: `Added subagent type pi:${name} → ${formatModel(model)}${readOnly ? ' (read-only)' : ''}.` }
       }
       return { text: 'Usage: /pi profile <add|rm|list> …' }
+    }
+
+    if (sub === 'fallback' || sub === 'fallbacks') {
+      const [action, ...refs] = rest
+      const list = s.fallbacks ?? []
+      const save = async (next: PiModel[]) => {
+        const { fallbacks: _, ...without } = s
+        await saveSettings($, next.length > 0 ? { ...without, fallbacks: next } : without, false)
+      }
+      if (action === undefined || action === 'list') {
+        return {
+          text:
+            list.length === 0
+              ? 'No fallback models. A stalled pi run is retried on its own model; add fallbacks with /pi fallback add <provider/model[:thinking]> …'
+              : `When a pi run stalls, retry 1 keeps its model, then: ${list.map(m => formatModel(m)).join(' → ')}`,
+        }
+      }
+      if (action === 'clear') {
+        await save([])
+        return { text: 'Fallback models cleared.' }
+      }
+      if (action === 'add' || action === 'rm' || action === 'remove') {
+        if (refs.length === 0) return { text: `Usage: /pi fallback ${action} <provider/model[:thinking]> …` }
+        const models: PiModel[] = []
+        for (const ref of refs) {
+          const m = parseModelRef(ref)
+          if (m === undefined) return { text: `Not a model reference: ${ref}` }
+          models.push(m)
+        }
+        const same = (a: PiModel, b: PiModel) => formatModel(a) === formatModel(b)
+        const next =
+          action === 'add'
+            ? [...list.filter(f => !models.some(m => same(f, m))), ...models]
+            : list.filter(f => !models.some(m => same(f, m)))
+        await save(next)
+        return {
+          text:
+            next.length === 0
+              ? 'No fallback models left.'
+              : `Fallback models: ${next.map(m => formatModel(m)).join(' → ')}`,
+        }
+      }
+      return { text: 'Usage: /pi fallback <add|rm|clear|list> [provider/model[:thinking] …]' }
     }
 
     // `/pi openai/gpt-5.5` is shorthand for `/pi model openai/gpt-5.5`.
@@ -711,6 +877,9 @@ function describe(s: PiSettings): string {
     `pi:agent, pi:explore → ${formatModel(s.defaultModel)}`,
     ...TIER_ALIASES.filter(a => s.tiers[a] !== undefined).map(a => `Agent model "${a}" → ${formatModel(s.tiers[a])}`),
     ...s.profiles.map(p => `pi:${p.name} → ${formatModel(p.model)}${p.readOnly ? ' (read-only)' : ''}`),
+    ...(s.fallbacks !== undefined && s.fallbacks.length > 0
+      ? [`Fallbacks when a run stalls: ${s.fallbacks.map(m => formatModel(m)).join(' → ')}`]
+      : []),
   ]
   return lines.join('\n')
 }
@@ -723,5 +892,6 @@ const HELP = [
   '/pi tier <alias> <ref>|reset  map the Agent tool’s model alias (haiku, sonnet, opus, fable) to a pi model',
   '/pi profile add <name> <ref> [--read-only] [description]   add a subagent type pi:<name>',
   '/pi profile rm <name> | list',
+  '/pi fallback add <ref> …    models a stalled run moves to from its 2nd retry (rm <ref>, clear, list)',
   '/pi models [search]         open the picker filtered',
 ].join('\n')

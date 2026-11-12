@@ -1,6 +1,6 @@
 {
   "name": "pi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run Claude Code subagents on the pi coding agent, with any pi provider and model.",
   "author": {
     "name": "Batista Harahap"
@@ -31,10 +31,22 @@
       "description": "auto: run in the background when the Agent call sets run_in_background, or when this session's Agent tool has no run_in_background parameter (so a long run can't block the turn). always: every pi run is a background task. never: every pi run is in the foreground with a live row.",
       "default": "auto"
     },
+    "stallTimeoutSec": {
+      "type": "number",
+      "title": "Stall timeout (seconds)",
+      "description": "A pi run that gets nothing from the model for this long while waiting on it counts as stalled (a stuck provider, common on OpenRouter): pi is stopped and the run resumes in a fresh pi session. Doubles on each retry.",
+      "default": 90
+    },
+    "stallRetries": {
+      "type": "number",
+      "title": "Stall retries",
+      "description": "How many times a stalled run (or one that hit a transient provider error such as a timeout or 502) is resumed in a fresh pi session, keeping its progress. Every /pi fallback model gets a retry of its own. 0 turns retrying off.",
+      "default": 2
+    },
     "idleTimeoutSec": {
       "type": "number",
       "title": "Idle timeout (seconds)",
-      "description": "Kill a pi run that sends no JSON event for this long, and report it as stalled.",
+      "description": "Kill a pi run whose tool (e.g. a long bash command) prints nothing for this long, and report it as hung.",
       "default": 180
     },
     "maxRunMinutes": {
